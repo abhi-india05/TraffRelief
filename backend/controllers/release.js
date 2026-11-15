@@ -15,16 +15,16 @@ const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
 const Release = require("../models/release.js");
 const Staff = require("../models/staff.js");
 const Victim = require("../models/victim.js");
+const Admin = require("../models/admin.js");
 
 const createRelease = async (req, res) => {
   try {
     const { staffId, victimId } = req.params;
+    const { id: authUserId, role: authRole } = req.user || {};
+
     if (!staffId || !victimId) {
       return res.status(400).json({ error: "staffId and victimId parameters are required" });
     }
-
-    // optional body validation
-    // if (!req.body) return res.status(400).json({ error: "Request body is required" });
 
     const victim = await Victim.findOne({ victimId: victimId });
     if (!victim) {
@@ -34,6 +34,20 @@ const createRelease = async (req, res) => {
     const staff = await Staff.findOne({ staffId: staffId });
     if (!staff) {
       return res.status(404).json({ error: "Staff not found" });
+    }
+
+    // Role-based authorization: staff must own victim and match parameter; admin must own victim's center
+    if (authRole === "staff") {
+      if (authUserId !== staffId || victim.staff?.toString() !== staff._id.toString()) {
+        return res.status(403).json({ error: "You are not authorized to create releases for this victim" });
+      }
+    } else if (authRole === "admin") {
+      const admin = await Admin.findOne({ adminId: authUserId });
+      if (!admin || victim.admin?.toString() !== admin._id.toString()) {
+        return res.status(403).json({ error: "Victim not under your administrative center" });
+      }
+    } else {
+      return res.status(403).json({ error: "Unauthorized role" });
     }
 
     if (victim.status !== "released") {
@@ -117,7 +131,7 @@ async function submitRelease(req, res) {
     ]);
 
     const transcript = transcriptionResult.response.text().trim();
-    console.log("Transcript:", transcript);
+    console.log("[submitRelease] Transcription completed (length: %d chars)", transcript.length);
 
     // Enforce privacy gate and sanitize text before summarization
     assertGeminiDataAccess({
@@ -131,12 +145,12 @@ async function submitRelease(req, res) {
 
     const summaryResult = await model.generateContent([{ text: summarizationPrompt }]);
     const summary = summaryResult.response.text().trim();
-    console.log("Summary:", summary);
+    console.log("[submitRelease] Summary generated (length: %d chars)", summary.length);
 
     // BERT / classification
     const bertResp = await axios.post(BERT_URL, { text: summary });
     const result = bertResp.data;
-    console.log("BERT Analysis:", result);
+    console.log("[submitRelease] BERT Analysis completed successfully");
 
     // ensure results object exists
     releaseRecord.submitted = true;
@@ -188,6 +202,8 @@ async function submitRelease(req, res) {
 async function viewReleaseResults(req, res) {
   try {
     const { hashId } = req.params;
+    const { id: authUserId, role: authRole } = req.user || {};
+
     if (!hashId) {
       return res.status(400).json({ error: "hashId parameter is required" });
     }
@@ -195,6 +211,26 @@ async function viewReleaseResults(req, res) {
     const releaseRecord = await Release.findOne({ hashLink: hashId }).populate("victimId").populate("staffId");
     if (!releaseRecord) {
       return res.status(404).json({ error: "Release record not found" });
+    }
+
+    const victim = releaseRecord.victimId;
+    if (!victim) {
+      return res.status(404).json({ error: "Associated victim not found" });
+    }
+
+    // Role-based patient isolation check
+    if (authRole === "staff") {
+      const staff = await Staff.findOne({ staffId: authUserId });
+      if (!staff || victim.staff?.toString() !== staff._id.toString()) {
+        return res.status(403).json({ error: "You are not assigned to this victim" });
+      }
+    } else if (authRole === "admin") {
+      const admin = await Admin.findOne({ adminId: authUserId });
+      if (!admin || victim.admin?.toString() !== admin._id.toString()) {
+        return res.status(403).json({ error: "Victim not under your administrative center" });
+      }
+    } else {
+      return res.status(403).json({ error: "Unauthorized role" });
     }
 
     if (!releaseRecord.submitted) {
@@ -207,40 +243,34 @@ async function viewReleaseResults(req, res) {
     res.status(500).json({ error: "Internal server error" });
   }
 }
-/*
-async function viewReleaseByVictim(req,res){
-  try{
-    const {victimId}= req.params;
-    if(!victimId){
-        return res.status(400).json({ error: "victimId parameter is required" });
+
+async function viewReleaseByVictim(req, res) {
+  try {
+    const { victimId } = req.params;
+    const { id: authUserId, role: authRole } = req.user || {};
+
+    if (!victimId) {
+      return res.status(400).json({ error: "victimId parameter is required" });
     }
 
-    const victim= await Victim.findOne({ victimId });
-    if(!victim){
-        return res.status(404).json({ error: "Victim not found" });
-    }
-    const releaseRecord= await Release.find({ victimId:victim._id});
-    if(!releaseRecord){
-        return res.status(404).json({ error: "Release record not found" });
-    }
-    return res.status(200).json({ release: releaseRecord });
-  } catch (error) {
-      console.error("Error fetching release by victim:", error);
-      res.status(500).json({ error: "Internal server error" });
-  }   
-}
-*/
-// ...existing code...
-async function viewReleaseByVictim(req,res){
-  try{
-    const {victimId}= req.params;
-    if(!victimId){
-        return res.status(400).json({ error: "victimId parameter is required" });
+    const victim = await Victim.findOne({ victimId });
+    if (!victim) {
+      return res.status(404).json({ error: "Victim not found" });
     }
 
-    const victim= await Victim.findOne({ victimId });
-    if(!victim){
-        return res.status(404).json({ error: "Victim not found" });
+    // Role-based patient isolation check
+    if (authRole === "staff") {
+      const staff = await Staff.findOne({ staffId: authUserId });
+      if (!staff || victim.staff?.toString() !== staff._id.toString()) {
+        return res.status(403).json({ error: "You are not assigned to this victim" });
+      }
+    } else if (authRole === "admin") {
+      const admin = await Admin.findOne({ adminId: authUserId });
+      if (!admin || victim.admin?.toString() !== admin._id.toString()) {
+        return res.status(403).json({ error: "Victim not under your administrative center" });
+      }
+    } else {
+      return res.status(403).json({ error: "Unauthorized role" });
     }
 
     // fetch all releases for this victim, populate staff and victim, sort newest first
@@ -250,14 +280,14 @@ async function viewReleaseByVictim(req,res){
       .sort({ createdAt: -1 });
 
     if (!Array.isArray(releaseRecords) || releaseRecords.length === 0) {
-        return res.status(404).json({ error: "No release records found for this victim" });
+      return res.status(404).json({ error: "No release records found for this victim" });
     }
 
     return res.status(200).json({ releases: releaseRecords });
   } catch (error) {
-      console.error("Error fetching release by victim:", error);
-      res.status(500).json({ error: "Internal server error" });
-  }   
+    console.error("Error fetching release by victim:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
 }
 // ...existing code...
 module.exports = { createRelease, submitRelease, viewReleaseResults, viewReleaseByVictim };

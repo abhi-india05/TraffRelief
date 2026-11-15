@@ -1,9 +1,9 @@
 'use strict';
 const mongoose = require('mongoose');
 const AuditEvidenceChunk = require('../../models/auditEvidenceChunk');
-const { embedQuery } = require('./embeddingService');
+const embeddingService = require('./embeddingService');
 
-const RAG_VECTOR_ENABLED = process.env.RAG_VECTOR_SEARCH_ENABLED === 'true';
+const isVectorEnabled = () => process.env.RAG_VECTOR_SEARCH_ENABLED === 'true';
 const VECTOR_INDEX_NAME = process.env.RAG_VECTOR_INDEX_NAME || 'audit_evidence_index';
 const TOP_K = parseInt(process.env.RAG_TOP_K_PER_DOMAIN || '5', 10);
 const MIN_COSINE_SIMILARITY = parseFloat(
@@ -54,13 +54,13 @@ const DOMAIN_QUERIES = {
  * @returns {Promise<Array>}
  */
 async function retrieveByDomain(domain, currentAudit, victimObjectId, currentAuditObjectId, currentAuditTimestamp, privacyOptions = {}) {
-  if (!RAG_VECTOR_ENABLED) return [];
+  if (!isVectorEnabled()) return [];
 
   try {
     const queryText = DOMAIN_QUERIES[domain](currentAudit);
     if (!queryText || queryText.length < 10) return [];
 
-    const queryVector = await embedQuery(queryText, privacyOptions);
+    const queryVector = await embeddingService.embedQuery(queryText, privacyOptions);
 
     // Atlas $vectorSearch with patient isolation pre-filter
     const pipeline = [
@@ -92,7 +92,8 @@ async function retrieveByDomain(domain, currentAudit, victimObjectId, currentAud
       { $match: { auditRef: { $ne: currentAuditObjectId } } },
       { $sort: { atlasScore: -1, timestamp: -1 } },
       { $limit: TOP_K },
-      { $project: { embedding: 0, _id: 0, victimId: 0, auditRef: 0 } } // strip internal/sensitive fields
+      // Preserve auditRef, partIndex, sourceFields, sourceSegments for server-side validation; exclude heavy embedding & victimId
+      { $project: { embedding: 0, _id: 0, victimId: 0 } }
     ];
 
     const results = await AuditEvidenceChunk.aggregate(pipeline);
@@ -119,7 +120,7 @@ async function retrieveByDomain(domain, currentAudit, victimObjectId, currentAud
  * @returns {Promise<{medical_physical: [], trauma_indicators: [], progress_tracking: [], retrievalMode: string}>}
  */
 async function retrieveSemanticContext(currentAudit, victimObjectId, currentAuditObjectId, currentAuditTimestamp, privacyOptions = {}) {
-  if (!RAG_VECTOR_ENABLED) {
+  if (!isVectorEnabled()) {
     return {
       medical_physical: [],
       trauma_indicators: [],

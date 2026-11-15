@@ -5,6 +5,15 @@ const Staff = require('../models/staff');
 const Admin = require('../models/admin');
 const Audit = require('../models/audit');
 
+const VALID_INTERVENTION_STATUSES = new Set([
+  'recommended',
+  'accepted',
+  'in_progress',
+  'completed',
+  'not_implemented',
+  'discontinued'
+]);
+
 /**
  * Get all interventions for a victim with strict authorization.
  * Route: GET /staff/interventions/:victimId or GET /admin/interventions/:victimId
@@ -87,17 +96,42 @@ async function createIntervention(req, res) {
       return res.status(403).json({ error: 'Unauthorized role' });
     }
 
+    // Validate status if provided
+    const targetStatus = status || 'recommended';
+    if (!VALID_INTERVENTION_STATUSES.has(targetStatus)) {
+      return res.status(400).json({
+        error: `Invalid status "${targetStatus}". Allowed: ${[...VALID_INTERVENTION_STATUSES].join(', ')}`
+      });
+    }
+
+    // Validate dateRecommended if provided
+    let targetDateRecommended = new Date();
+    if (dateRecommended) {
+      const parsedDate = new Date(dateRecommended);
+      if (isNaN(parsedDate.getTime())) {
+        return res.status(400).json({ error: 'Invalid dateRecommended format' });
+      }
+      targetDateRecommended = parsedDate;
+    }
+
     let auditRef = null;
     let auditIdStr = null;
     let determinedSourceType = sourceType === 'manual' ? 'manual' : 'audit_recommendation';
 
+    // Strict source audit validation
     if (sourceAuditId && sourceAuditId !== 'MANUAL') {
       const audit = await Audit.findOne({ auditId: sourceAuditId });
-      if (audit) {
-        auditRef = audit._id;
-        auditIdStr = audit.auditId;
-        determinedSourceType = 'audit_recommendation';
+      if (!audit) {
+        return res.status(400).json({ error: `Source audit "${sourceAuditId}" not found` });
       }
+      if (audit.victimId.toString() !== victim._id.toString()) {
+        return res.status(400).json({
+          error: `Source audit "${sourceAuditId}" does not belong to victim "${victim.victimId}"`
+        });
+      }
+      auditRef = audit._id;
+      auditIdStr = audit.auditId;
+      determinedSourceType = 'audit_recommendation';
     } else {
       determinedSourceType = 'manual';
     }
@@ -108,9 +142,9 @@ async function createIntervention(req, res) {
       sourceAuditId: auditIdStr,
       sourceType: determinedSourceType,
       recommendedIntervention: recommendedIntervention.trim(),
-      status: status || 'recommended',
+      status: targetStatus,
       staffResponsible: staff ? staff._id : (victim.staff || null),
-      dateRecommended: dateRecommended ? new Date(dateRecommended) : new Date(),
+      dateRecommended: targetDateRecommended,
       staffNotes: staffNotes ? staffNotes.trim() : null
     });
 
@@ -123,14 +157,28 @@ async function createIntervention(req, res) {
 }
 
 /**
- * Update an existing intervention status/outcome with strict authorization.
+ * Update an existing intervention status/outcome with strict authorization and validation.
  * Route: PATCH /staff/interventions/:interventionId or PATCH /admin/interventions/:interventionId
  */
 async function updateIntervention(req, res) {
   try {
     const { interventionId } = req.params;
     const { id: authUserId, role: authRole } = req.user || {};
-    const { status, observedOutcome, staffNotes, dateImplemented, followUpAuditId } = req.body;
+    const {
+      status,
+      observedOutcome,
+      staffNotes,
+      dateImplemented,
+      followUpAuditId,
+      victimId,
+      sourceAuditRef,
+      sourceAuditId
+    } = req.body;
+
+    // Disallow modifying immutable ownership fields
+    if (victimId !== undefined || sourceAuditRef !== undefined || sourceAuditId !== undefined) {
+      return res.status(400).json({ error: 'Cannot modify immutable intervention ownership fields' });
+    }
 
     const intervention = await RehabilitationIntervention.findById(interventionId);
     if (!intervention) return res.status(404).json({ error: 'Intervention not found' });
@@ -154,14 +202,51 @@ async function updateIntervention(req, res) {
     }
 
     const updates = {};
-    if (status) updates.status = status;
+
+    // Validate status lifecycle
+    if (status !== undefined) {
+      if (!VALID_INTERVENTION_STATUSES.has(status)) {
+        return res.status(400).json({
+          error: `Invalid status "${status}". Allowed: ${[...VALID_INTERVENTION_STATUSES].join(', ')}`
+        });
+      }
+      updates.status = status;
+    }
+
     if (observedOutcome !== undefined) updates.observedOutcome = observedOutcome;
     if (staffNotes !== undefined) updates.staffNotes = staffNotes;
-    if (dateImplemented) updates.dateImplemented = new Date(dateImplemented);
-    if (followUpAuditId) {
-      updates.followUpAuditId = followUpAuditId;
-      const followUpAudit = await Audit.findOne({ auditId: followUpAuditId });
-      if (followUpAudit) updates.followUpAuditRef = followUpAudit._id;
+
+    // Validate dateImplemented
+    if (dateImplemented !== undefined) {
+      if (dateImplemented === null || dateImplemented === '') {
+        updates.dateImplemented = null;
+      } else {
+        const parsedImpl = new Date(dateImplemented);
+        if (isNaN(parsedImpl.getTime())) {
+          return res.status(400).json({ error: 'Invalid dateImplemented format' });
+        }
+        updates.dateImplemented = parsedImpl;
+      }
+    }
+
+    // Validate followUpAuditId
+    if (followUpAuditId !== undefined) {
+      if (followUpAuditId === null || followUpAuditId === '') {
+        updates.followUpAuditId = null;
+        updates.followUpAuditRef = null;
+      } else {
+        const followUpAudit = await Audit.findOne({ auditId: followUpAuditId });
+        if (!followUpAudit) {
+          return res.status(400).json({ error: `Follow-up audit "${followUpAuditId}" not found` });
+        }
+        if (followUpAudit.victimId.toString() !== intervention.victimId.toString()) {
+          return res.status(400).json({
+            error: `Follow-up audit "${followUpAuditId}" does not belong to this intervention's patient`
+          });
+        }
+        updates.followUpAuditId = followUpAudit.auditId;
+        updates.followUpAuditRef = followUpAudit._id;
+      }
     }
 
     const updated = await RehabilitationIntervention.findByIdAndUpdate(
@@ -177,4 +262,9 @@ async function updateIntervention(req, res) {
   }
 }
 
-module.exports = { getVictimInterventions, createIntervention, updateIntervention };
+module.exports = {
+  getVictimInterventions,
+  createIntervention,
+  updateIntervention,
+  VALID_INTERVENTION_STATUSES
+};

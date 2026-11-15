@@ -5,8 +5,26 @@ const mongoose = require('mongoose');
 
 const {
   ATLAS_SCORE_THRESHOLD,
-  MIN_COSINE_SIMILARITY
+  MIN_COSINE_SIMILARITY,
+  retrieveByDomain
 } = require('../services/auditEvaluation/vectorRetrieval');
+const { assertGeminiDataAccess } = require('../services/geminiPrivacyPolicy');
+const AuditEvidenceChunk = require('../models/auditEvidenceChunk');
+const Victim = require('../models/victim');
+const Staff = require('../models/staff');
+const Admin = require('../models/admin');
+const Audit = require('../models/audit');
+const Release = require('../models/release');
+const RehabilitationIntervention = require('../models/rehabilitationIntervention');
+
+const {
+  createIntervention,
+  updateIntervention
+} = require('../controllers/intervention');
+const {
+  viewReleaseResults
+} = require('../controllers/release');
+
 const {
   SYNTHETIC_VICTIM_ID_1,
   SYNTHETIC_VICTIM_ID_2,
@@ -15,124 +33,301 @@ const {
   SYNTHETIC_ADMIN_ID_1
 } = require('./fixtures/syntheticPatients');
 
+function mockRes() {
+  const res = {
+    statusCode: 200,
+    body: null,
+    status(code) {
+      res.statusCode = code;
+      return res;
+    },
+    json(data) {
+      res.body = data;
+      return res;
+    }
+  };
+  return res;
+}
+
 test('D. Security & Patient Isolation Suite', async (t) => {
 
   await t.test('1. Atlas vector search score conversion accurately maps cosine similarity', () => {
-    // Priority 6: In Atlas Vector Search with similarity="cosine", vectorSearchScore = (1 + cosine) / 2
-    // If raw cosine threshold is 0.60, Atlas score threshold must be 0.80
     assert.equal(MIN_COSINE_SIMILARITY, 0.60);
     assert.equal(ATLAS_SCORE_THRESHOLD, 0.80);
 
-    // Verify reverse mapping: rawCosine = 2 * atlasScore - 1
     const testAtlasScore = 0.85;
     const computedRawCosine = 2 * testAtlasScore - 1;
     assert.ok(Math.abs(computedRawCosine - 0.70) < 1e-6);
 
-    // A low Atlas score like 0.60 represents raw cosine of 0.20 and must be rejected by threshold
     const lowAtlasScore = 0.60;
     assert.ok(lowAtlasScore < ATLAS_SCORE_THRESHOLD, 'Atlas score 0.60 (raw cosine 0.20) must be rejected by 0.80 threshold');
   });
 
-  await t.test('2. Staff member identity mismatch is rejected (identity spoofing check)', () => {
-    const authenticatedStaffId = 'STAFF-001';
-    const routeParamStaffId = 'STAFF-002'; // spoof attempt
+  await t.test('2. Vector search pipeline construction strictly enforces patient isolation, thresholds, and domain filters', async () => {
+    const originalEnabled = process.env.RAG_VECTOR_SEARCH_ENABLED;
+    const originalAggregate = AuditEvidenceChunk.aggregate;
+    const embeddingService = require('../services/auditEvaluation/embeddingService');
+    const originalEmbedQuery = embeddingService.embedQuery;
 
-    const checkStaffIdentity = (authRole, authUser, targetStaff) => {
-      if (authRole === 'staff' && authUser !== targetStaff) {
-        return false;
-      }
-      return true;
+    process.env.RAG_VECTOR_SEARCH_ENABLED = 'true';
+    embeddingService.embedQuery = async () => Array(768).fill(0.05);
+
+    let capturedPipeline = null;
+    AuditEvidenceChunk.aggregate = async (pipeline) => {
+      capturedPipeline = pipeline;
+      return [];
     };
 
-    assert.equal(checkStaffIdentity('staff', authenticatedStaffId, routeParamStaffId), false);
-    assert.equal(checkStaffIdentity('staff', authenticatedStaffId, authenticatedStaffId), true);
+    try {
+      const victimOid = new mongoose.Types.ObjectId(SYNTHETIC_VICTIM_ID_1);
+      const currentAuditOid = new mongoose.Types.ObjectId();
+      const cutoffTime = new Date('2026-03-01T00:00:00Z');
+      const testAudit = { currentPhysicalSymptoms: 'Severe joint pain and dizziness' };
+
+      await retrieveByDomain('medical_physical', testAudit, victimOid, currentAuditOid, cutoffTime, {
+        dataClassification: 'synthetic',
+        databaseName: 'traffrelief_synthetic'
+      });
+
+      assert.ok(capturedPipeline, 'Atlas aggregate pipeline should be executed');
+
+      // Check step 0: $vectorSearch
+      const vectorStep = capturedPipeline[0].$vectorSearch;
+      assert.ok(vectorStep, '$vectorSearch step must be present');
+      assert.equal(vectorStep.filter.victimId.toString(), victimOid.toString(), 'Patient isolation filter must match target victimId');
+      assert.equal(vectorStep.filter.domain, 'medical_physical');
+      assert.deepEqual(vectorStep.filter.timestamp, { $lt: cutoffTime });
+
+      // Check step 3: Atlas threshold match
+      const thresholdMatch = capturedPipeline.find(step => step.$match && step.$match.atlasScore);
+      assert.ok(thresholdMatch, 'Pipeline must filter by atlasScore threshold');
+      assert.equal(thresholdMatch.$match.atlasScore.$gte, ATLAS_SCORE_THRESHOLD);
+
+      // Check step 4: Exclude current audit
+      const excludeCurrentMatch = capturedPipeline.find(step => step.$match && step.$match.auditRef);
+      assert.ok(excludeCurrentMatch, 'Pipeline must exclude current auditRef');
+      assert.deepEqual(excludeCurrentMatch.$match.auditRef, { $ne: currentAuditOid });
+
+      // Check step 6: Projection preserves required traceability fields
+      const projectStep = capturedPipeline.find(step => step.$project);
+      assert.ok(projectStep, 'Pipeline must project fields');
+      assert.equal(projectStep.$project.embedding, 0);
+      assert.equal(projectStep.$project.victimId, 0);
+
+    } finally {
+      process.env.RAG_VECTOR_SEARCH_ENABLED = originalEnabled;
+      AuditEvidenceChunk.aggregate = originalAggregate;
+      embeddingService.embedQuery = originalEmbedQuery;
+    }
   });
 
-  await t.test('3. Staff member cannot access or audit an unassigned patient', () => {
-    const mockVictim = {
-      _id: SYNTHETIC_VICTIM_ID_1,
-      staff: SYNTHETIC_STAFF_ID_1 // assigned to staff 1
-    };
+  await t.test('3. Actual Express handler: Staff member cannot create intervention for unassigned patient', async () => {
+    const origVictimFindOne = Victim.findOne;
+    const origStaffFindOne = Staff.findOne;
 
-    const isAssigned = (victim, staffObjectId) => {
-      return victim.staff && victim.staff.toString() === staffObjectId.toString();
-    };
+    Victim.findOne = async () => ({
+      _id: new mongoose.Types.ObjectId(SYNTHETIC_VICTIM_ID_1),
+      victimId: 'VIC-SYN-001',
+      staff: new mongoose.Types.ObjectId(SYNTHETIC_STAFF_ID_1) // Assigned to Staff 1
+    });
 
-    assert.equal(isAssigned(mockVictim, SYNTHETIC_STAFF_ID_1), true);
-    assert.equal(isAssigned(mockVictim, SYNTHETIC_STAFF_ID_2), false);
+    Staff.findOne = async () => ({
+      _id: new mongoose.Types.ObjectId(SYNTHETIC_STAFF_ID_2), // Different staff ID
+      staffId: 'STAFF-002'
+    });
+
+    try {
+      const req = {
+        params: { victimId: 'VIC-SYN-001' },
+        user: { id: 'STAFF-002', role: 'staff' },
+        body: { recommendedIntervention: 'Daily physical therapy' }
+      };
+      const res = mockRes();
+
+      await createIntervention(req, res);
+      assert.equal(res.statusCode, 403);
+      assert.ok(res.body.error.includes('not assigned to this victim'));
+    } finally {
+      Victim.findOne = origVictimFindOne;
+      Staff.findOne = origStaffFindOne;
+    }
   });
 
-  await t.test('4. Admin scope isolation: admin cannot access victim under different admin', () => {
-    const mockVictim = {
-      _id: SYNTHETIC_VICTIM_ID_1,
-      admin: SYNTHETIC_ADMIN_ID_1
-    };
-    const otherAdminId = new mongoose.Types.ObjectId();
+  await t.test('4. Actual Express handler: Cross-victim sourceAuditId in createIntervention is strictly rejected', async () => {
+    const origVictimFindOne = Victim.findOne;
+    const origStaffFindOne = Staff.findOne;
+    const origAuditFindOne = Audit.findOne;
 
-    const isAdminAuthorized = (victim, adminObjectId) => {
-      return victim.admin && victim.admin.toString() === adminObjectId.toString();
-    };
+    const assignedStaffOid = new mongoose.Types.ObjectId(SYNTHETIC_STAFF_ID_1);
+    const targetVictimOid = new mongoose.Types.ObjectId(SYNTHETIC_VICTIM_ID_1);
+    const differentVictimOid = new mongoose.Types.ObjectId(SYNTHETIC_VICTIM_ID_2);
 
-    assert.equal(isAdminAuthorized(mockVictim, SYNTHETIC_ADMIN_ID_1), true);
-    assert.equal(isAdminAuthorized(mockVictim, otherAdminId), false);
-  });
+    Victim.findOne = async () => ({
+      _id: targetVictimOid,
+      victimId: 'VIC-SYN-001',
+      staff: assignedStaffOid
+    });
 
-  await t.test('5. Vector retrieval query strictly enforces patient isolation filter via victimId', () => {
-    const victimObjectId = SYNTHETIC_VICTIM_ID_1;
-    const domain = 'medical_physical';
-    const cutoffDate = new Date();
+    Staff.findOne = async () => ({
+      _id: assignedStaffOid,
+      staffId: 'STAFF-001'
+    });
 
-    const vectorFilter = {
-      victimId: victimObjectId,
-      domain: domain,
-      timestamp: { $lt: cutoffDate }
-    };
-
-    // Verify filter mandates exact victimId
-    assert.equal(vectorFilter.victimId.toString(), SYNTHETIC_VICTIM_ID_1.toString());
-    assert.notEqual(vectorFilter.victimId.toString(), SYNTHETIC_VICTIM_ID_2.toString());
-    assert.ok(vectorFilter.victimId instanceof mongoose.Types.ObjectId);
-  });
-
-  await t.test('6. Evaluation retry never creates duplicate audits (idempotency guard)', () => {
-    let mockAuditDoc = {
+    // Audit belongs to a DIFFERENT victim
+    Audit.findOne = async () => ({
       _id: new mongoose.Types.ObjectId(),
-      auditId: 'AUD-SYN-101',
-      evaluationStatus: 'failed',
-      callCount: 0
-    };
+      auditId: 'AUD-DIFFERENT-PATIENT',
+      victimId: differentVictimOid
+    });
 
-    const claimEvaluation = (doc) => {
-      if (['pending', 'failed'].includes(doc.evaluationStatus)) {
-        doc.evaluationStatus = 'processing';
-        doc.callCount++;
-        return true; // claimed
-      }
-      return false; // rejected / concurrent conflict
-    };
+    try {
+      const req = {
+        params: { victimId: 'VIC-SYN-001' },
+        user: { id: 'STAFF-001', role: 'staff' },
+        body: {
+          recommendedIntervention: 'Medication management',
+          sourceAuditId: 'AUD-DIFFERENT-PATIENT'
+        }
+      };
+      const res = mockRes();
 
-    // First attempt claims it
-    const claim1 = claimEvaluation(mockAuditDoc);
-    assert.equal(claim1, true);
-    assert.equal(mockAuditDoc.evaluationStatus, 'processing');
-
-    // Concurrent second attempt rejected without duplicate audit
-    const claim2 = claimEvaluation(mockAuditDoc);
-    assert.equal(claim2, false);
-    assert.equal(mockAuditDoc.callCount, 1);
+      await createIntervention(req, res);
+      assert.equal(res.statusCode, 400);
+      assert.ok(res.body.error.includes('does not belong to victim'));
+    } finally {
+      Victim.findOne = origVictimFindOne;
+      Staff.findOne = origStaffFindOne;
+      Audit.findOne = origAuditFindOne;
+    }
   });
 
-  await t.test('7. Manual interventions do not require an audit reference (sourceType="manual")', () => {
-    const manualIntervention = {
-      victimId: SYNTHETIC_VICTIM_ID_1,
-      sourceAuditRef: null,
-      sourceAuditId: null,
-      sourceType: 'manual',
-      recommendedIntervention: 'Daily physical therapy for ankle rehabilitation'
-    };
+  await t.test('5. Actual Express handler: Modifying immutable fields in updateIntervention is rejected', async () => {
+    const origInterventionFindById = RehabilitationIntervention.findById;
+    const origVictimFindById = Victim.findById;
+    const origStaffFindOne = Staff.findOne;
 
-    assert.equal(manualIntervention.sourceType, 'manual');
-    assert.equal(manualIntervention.sourceAuditRef, null);
-    assert.ok(manualIntervention.recommendedIntervention.length > 0);
+    const staffOid = new mongoose.Types.ObjectId(SYNTHETIC_STAFF_ID_1);
+    const victimOid = new mongoose.Types.ObjectId(SYNTHETIC_VICTIM_ID_1);
+
+    RehabilitationIntervention.findById = () => ({
+      populate: () => ({
+        populate: () => ({
+          populate: async () => ({
+            _id: new mongoose.Types.ObjectId(),
+            victimId: victimOid,
+            status: 'recommended',
+            save: async () => {}
+          })
+        })
+      })
+    });
+
+    Victim.findById = async () => ({
+      _id: victimOid,
+      staff: staffOid
+    });
+
+    Staff.findOne = async () => ({
+      _id: staffOid,
+      staffId: 'STAFF-001'
+    });
+
+    try {
+      // Attempt to reassign intervention to another victim
+      const req = {
+        params: { id: new mongoose.Types.ObjectId().toString() },
+        user: { id: 'STAFF-001', role: 'staff' },
+        body: { victimId: new mongoose.Types.ObjectId().toString() }
+      };
+      const res = mockRes();
+
+      await updateIntervention(req, res);
+      assert.equal(res.statusCode, 400);
+      assert.ok(res.body.error.includes('immutable'));
+    } finally {
+      RehabilitationIntervention.findById = origInterventionFindById;
+      Victim.findById = origVictimFindById;
+      Staff.findOne = origStaffFindOne;
+    }
+  });
+
+  await t.test('6. Actual Express handler: viewReleaseResults verifies staff authorization', async () => {
+    const origReleaseFindOne = Release.findOne;
+    const origStaffFindOne = Staff.findOne;
+
+    const staffOid1 = new mongoose.Types.ObjectId(SYNTHETIC_STAFF_ID_1);
+    const staffOid2 = new mongoose.Types.ObjectId(SYNTHETIC_STAFF_ID_2);
+
+    Release.findOne = () => ({
+      populate: () => ({
+        populate: async () => ({
+          _id: new mongoose.Types.ObjectId(),
+          hashLink: 'test-hash-link',
+          submitted: true,
+          victimId: {
+            _id: new mongoose.Types.ObjectId(SYNTHETIC_VICTIM_ID_1),
+            staff: staffOid1 // Assigned to Staff 1
+          },
+          staffId: {
+            _id: staffOid1
+          }
+        })
+      })
+    });
+
+    Staff.findOne = async () => ({
+      _id: staffOid2, // Authenticated user is Staff 2
+      staffId: 'STAFF-002'
+    });
+
+    try {
+      const req = {
+        params: { hashId: 'test-hash-link' },
+        user: { id: 'STAFF-002', role: 'staff' }
+      };
+      const res = mockRes();
+
+      await viewReleaseResults(req, res);
+      assert.equal(res.statusCode, 403);
+      assert.ok(res.body.error.includes('not assigned to this victim'));
+    } finally {
+      Release.findOne = origReleaseFindOne;
+      Staff.findOne = origStaffFindOne;
+    }
+  });
+
+  await t.test('7. Centralized privacy policy: Cross-patient data leakage detection in source records', () => {
+    const originalTier = process.env.GEMINI_API_TIER;
+    const originalAllow = process.env.ALLOW_FREE_GEMINI_FOR_SYNTHETIC_DATA;
+    const originalKey = process.env.GEMINI_API_KEY;
+
+    try {
+      process.env.GEMINI_API_KEY = 'mock_key_for_testing';
+      process.env.GEMINI_API_TIER = 'free';
+      process.env.ALLOW_FREE_GEMINI_FOR_SYNTHETIC_DATA = 'true';
+
+      const patient1Oid = new mongoose.Types.ObjectId(SYNTHETIC_VICTIM_ID_1);
+      const patient2Oid = new mongoose.Types.ObjectId(SYNTHETIC_VICTIM_ID_2);
+
+      const mixedSourceRecords = [
+        { auditId: 'AUD-P1-01', victimId: patient1Oid, dataClassification: 'synthetic' },
+        { auditId: 'AUD-P2-01', victimId: patient2Oid, dataClassification: 'synthetic' } // Leakage!
+      ];
+
+      assert.throws(
+        () => assertGeminiDataAccess({
+          operation: 'test_isolation',
+          dataClassification: 'synthetic',
+          databaseName: 'traffrelief_synthetic',
+          patientId: patient1Oid,
+          sourceRecords: mixedSourceRecords
+        }),
+        /Cross-patient data leakage detected/
+      );
+    } finally {
+      process.env.GEMINI_API_TIER = originalTier;
+      process.env.ALLOW_FREE_GEMINI_FOR_SYNTHETIC_DATA = originalAllow;
+      process.env.GEMINI_API_KEY = originalKey;
+    }
   });
 });

@@ -100,7 +100,7 @@ async function runBackfill() {
           `  ${auditLabel}: indexed=${result.indexed}, skipped=${result.skipped}, failed=${result.failed}`
         );
       } catch (err) {
-        totalFailed += 3; // 3 chunks
+        totalFailed++;
         console.error(`  ERROR processing ${auditLabel}:`, err.message);
       }
 

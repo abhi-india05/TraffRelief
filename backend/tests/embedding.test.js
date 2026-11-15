@@ -150,4 +150,115 @@ test('A. Embedding & Chunking Suite', async (t) => {
       process.env.GEMINI_API_KEY = originalKey;
     }
   });
+
+  await t.test('11. Actual indexAudit: Multi-chunk indexing with stable partIndex, deduplication, and stale cleanup', async () => {
+    const { indexAudit } = require('../services/auditEvaluation/auditIndexingService');
+    const AuditEvidenceChunk = require('../models/auditEvidenceChunk');
+    const embeddingService = require('../services/auditEvaluation/embeddingService');
+
+    const origFindOne = AuditEvidenceChunk.findOne;
+    const origFindOneAndUpdate = AuditEvidenceChunk.findOneAndUpdate;
+    const origDeleteMany = AuditEvidenceChunk.deleteMany;
+    const origEmbedDocument = embeddingService.embedDocument;
+    const origVectorEnabled = process.env.RAG_VECTOR_SEARCH_ENABLED;
+
+    process.env.RAG_VECTOR_SEARCH_ENABLED = 'true';
+
+    const upsertedChunks = [];
+    const deletedFilters = [];
+    let embeddingCalls = 0;
+
+    embeddingService.embedDocument = async (text) => {
+      embeddingCalls++;
+      return Array(768).fill(0.01);
+    };
+
+    // First indexing: no existing chunks in DB
+    AuditEvidenceChunk.findOne = async () => null;
+    AuditEvidenceChunk.findOneAndUpdate = async (filter, update) => {
+      upsertedChunks.push({ filter, update: update.$set });
+      return { _id: 'chunk-123' };
+    };
+    AuditEvidenceChunk.deleteMany = async (filter) => {
+      deletedFilters.push(filter);
+      return { deletedCount: 0 };
+    };
+
+    try {
+      // 1. Oversized domain produces multiple subchunks with partIndex
+      const oversizedAudit = {
+        _id: 'AUD-OID-101',
+        auditId: 'AUD-MULTI-101',
+        victimId: 'VIC-OID-001',
+        timestamp: new Date('2026-03-01'),
+        currentPhysicalSymptoms: 'Mild fatigue',
+        // Oversized trauma indicators (>8000 chars) to trigger 2 subchunks
+        traumaIndicators: 'Flashbacks and severe distress recurring during sleep. '.repeat(200),
+        therapyAttendanceRate: '100%'
+      };
+
+      const result = await indexAudit(oversizedAudit, {
+        dataClassification: 'synthetic',
+        databaseName: 'traffrelief_synthetic'
+      });
+
+      assert.equal(result.success, true);
+      // medical (1 part) + trauma (2 parts) + progress (1 part) = 4 chunks total
+      assert.equal(result.indexed, 4);
+      assert.equal(result.failed, 0);
+
+      // Verify stable partIndex in upsert filters
+      const traumaUpserts = upsertedChunks.filter(u => u.filter.domain === 'trauma_indicators');
+      assert.equal(traumaUpserts.length, 2, 'Oversized trauma indicators must produce 2 subchunks');
+      assert.equal(traumaUpserts[0].filter.partIndex, 0);
+      assert.equal(traumaUpserts[1].filter.partIndex, 1);
+      assert.equal(traumaUpserts[0].update.partCount, 2);
+      assert.equal(traumaUpserts[1].update.partCount, 2);
+      assert.ok(Array.isArray(traumaUpserts[0].update.sourceSegments));
+
+      // 2. Re-indexing unchanged content skips embedding via contentHash
+      AuditEvidenceChunk.findOne = async (filter) => {
+        // Return existing matching chunk with same contentHash
+        const existing = upsertedChunks.find(
+          u => u.filter.domain === filter.domain && u.filter.partIndex === filter.partIndex
+        );
+        return existing ? { contentHash: existing.update.contentHash, indexingStatus: 'completed' } : null;
+      };
+
+      const reindexResult = await indexAudit(oversizedAudit, {
+        dataClassification: 'synthetic',
+        databaseName: 'traffrelief_synthetic'
+      });
+      assert.equal(reindexResult.skipped, 4, 'Unchanged content should be skipped via contentHash');
+
+      // 3. Cleanup of stale subchunks when content shrinks
+      const smallAudit = {
+        _id: 'AUD-OID-101',
+        auditId: 'AUD-MULTI-101',
+        victimId: 'VIC-OID-001',
+        timestamp: new Date('2026-03-01'),
+        currentPhysicalSymptoms: 'Mild fatigue',
+        traumaIndicators: 'Now mild flashbacks only.', // Shrunk back to 1 part
+        therapyAttendanceRate: '100%'
+      };
+
+      deletedFilters.length = 0;
+      await indexAudit(smallAudit, {
+        dataClassification: 'synthetic',
+        databaseName: 'traffrelief_synthetic'
+      });
+
+      // Must clean up partIndex >= 1 for trauma domain
+      const staleCleanup = deletedFilters.find(f => f.domain === 'trauma_indicators');
+      assert.ok(staleCleanup, 'Stale subchunks must be cleaned up when content shrinks');
+      assert.deepEqual(staleCleanup.partIndex, { $gte: 1 });
+
+    } finally {
+      AuditEvidenceChunk.findOne = origFindOne;
+      AuditEvidenceChunk.findOneAndUpdate = origFindOneAndUpdate;
+      AuditEvidenceChunk.deleteMany = origDeleteMany;
+      embeddingService.embedDocument = origEmbedDocument;
+      process.env.RAG_VECTOR_SEARCH_ENABLED = origVectorEnabled;
+    }
+  });
 });

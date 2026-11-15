@@ -201,6 +201,36 @@ function runComparison() {
     const cSafetyFound = s.hasCriticalSafety ? cSafetyEvaluation.urgent : true;
     const cBaselineFound = priorAudits.length > 0 ? (cAssembled.baselineAudit !== null || s.audits.length <= 2) : true;
 
+    // Measure actual evidence reference validation & grounding using validateAndSanitize
+    let cValidRefs = 0;
+    let cTotalRefs = 0;
+    if (priorAudits.length > 0) {
+      const sampleEvaluation = {
+        domain_evaluations: {
+          medical_physical: { status: 'improving', reasons: ['Clinical stability observed.'], evidence: ['Documented normal status'], evidenceReferences: [] },
+          trauma_indicators: {
+            status: s.expectedTraumaTrend || 'improving',
+            reasons: ['Patient trauma presentation tracked.'],
+            evidence: ['Historical vs current comparison.'],
+            evidenceReferences: priorAudits.map(a => ({
+              auditId: a.auditId,
+              field: 'traumaIndicators',
+              observation: (a.traumaIndicators || 'Distress observed').slice(0, 30),
+              sourceType: 'structured'
+            }))
+          },
+          progress_tracking: { status: 'improving', reasons: ['Attending activities.'], evidence: ['Regular attendance'], evidenceReferences: [] }
+        },
+        urgent: cSafetyEvaluation.urgent,
+        recommended_actions: ['Continue therapeutic plan.'],
+        fit_for_discharge: !cSafetyEvaluation.urgent
+      };
+
+      cTotalRefs = priorAudits.length;
+      const validation = validateAndSanitize(sampleEvaluation, cAssembled, cSafetyEvaluation);
+      cValidRefs = validation.result?.domain_evaluations?.trauma_indicators?.evidenceReferences?.length || 0;
+    }
+
     if (aSafetyFound) results.baselineA.safetyRecall++;
     if (bSafetyFound) results.baselineB.safetyRecall++;
     if (cSafetyFound) results.proposedC.safetyRecall++;
@@ -213,11 +243,15 @@ function runComparison() {
     results.baselineB.avgContextSizeChars += bContextChars;
     results.proposedC.avgContextSizeChars += cContextChars;
 
+    const propStatus = (cSafetyFound && cBaselineFound)
+      ? (cTotalRefs > 0 ? `PASS (${cValidRefs}/${cTotalRefs} Grounded)` : 'PASS (Intake)')
+      : 'FAIL';
+
     tableRows.push({
       scenario: `#${s.id} ${s.name.substring(0, 32)}`,
       baseA: aSafetyFound && aBaselineFound ? 'PASS' : (aSafetyFound ? 'NO BASELINE' : 'MISSED SAFETY'),
       baseB: bSafetyFound ? 'PASS' : 'PARTIAL',
-      propC: 'PASS (Evidence Traceable)'
+      propC: propStatus
     });
   }
 
@@ -225,6 +259,9 @@ function runComparison() {
   results.baselineA.avgContextSizeChars = Math.round(results.baselineA.avgContextSizeChars / numScenarios);
   results.baselineB.avgContextSizeChars = Math.round(results.baselineB.avgContextSizeChars / numScenarios);
   results.proposedC.avgContextSizeChars = Math.round(results.proposedC.avgContextSizeChars / numScenarios);
+
+  const isAtlasEnabled = process.env.RAG_VECTOR_SEARCH_ENABLED === 'true';
+  const retrievalModeLabel = isAtlasEnabled ? 'Real Atlas Vector Search' : 'Deterministic Synthetic Chunks';
 
   console.log('| Scenario Name                     | Baseline A (2-Audit) | Baseline B (Structured) | Proposed C (Hybrid RAG) |');
   console.log('|-----------------------------------|----------------------|-------------------------|-------------------------|');
@@ -238,6 +275,8 @@ function runComparison() {
   console.log('='.repeat(78));
 
   console.log('\nSUMMARY METRICS:');
+  console.log(`- Retrieval Environment:`);
+  console.log(`    Mode: ${retrievalModeLabel} (RAG_VECTOR_SEARCH_ENABLED=${process.env.RAG_VECTOR_SEARCH_ENABLED || 'false'})`);
   console.log(`- Safety Indicator Recall:`);
   console.log(`    Baseline A:  ${(results.baselineA.safetyRecall / numScenarios * 100).toFixed(0)}% (fails on older non-adjacent self-harm incidents)`);
   console.log(`    Baseline B:  ${(results.baselineB.safetyRecall / numScenarios * 100).toFixed(0)}% (guaranteed by deterministic safety query)`);
@@ -247,11 +286,6 @@ function runComparison() {
   console.log(`    Baseline A:  ${(results.baselineA.baselineContextPreserved / numScenarios * 100).toFixed(0)}% (drops intake baseline once audit count > 2)`);
   console.log(`    Baseline B:  ${(results.baselineB.baselineContextPreserved / numScenarios * 100).toFixed(0)}% (baseline audit explicitly retrieved)`);
   console.log(`    Proposed C:  ${(results.proposedC.baselineContextPreserved / numScenarios * 100).toFixed(0)}% (baseline explicitly preserved + indexed)`);
-
-  console.log(`- Evidence Reference Traceability:`);
-  console.log(`    Baseline A:  0% (plain string reasons only, no verified auditId links)`);
-  console.log(`    Baseline B:  50% (reasons mention dates, but no strict reference validation)`);
-  console.log(`    Proposed C:  100% (strict auditId validation, hallucinated links stripped)`);
 
   console.log(`- Average Prompt Context Budget:`);
   console.log(`    Baseline A:  ~${results.baselineA.avgContextSizeChars} chars`);

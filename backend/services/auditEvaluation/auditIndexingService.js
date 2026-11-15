@@ -3,23 +3,26 @@ const mongoose = require('mongoose');
 const AuditEvidenceChunk = require('../../models/auditEvidenceChunk');
 const Victim = require('../../models/victim');
 const { buildChunks } = require('./auditChunkBuilder');
-const { embedDocument, computeContentHash, EMBEDDING_MODEL, EMBEDDING_DIMENSIONS } = require('./embeddingService');
+const embeddingService = require('./embeddingService');
 
-const RAG_ENABLED = process.env.RAG_ENABLED === 'true';
-const RAG_VECTOR_ENABLED = process.env.RAG_VECTOR_SEARCH_ENABLED === 'true';
-const EMBEDDING_VERSION = `${EMBEDDING_MODEL}@768`;
+const isRagEnabled = () => process.env.RAG_ENABLED !== 'false';
+const isVectorEnabled = () => process.env.RAG_VECTOR_SEARCH_ENABLED === 'true';
+const getEmbeddingVersion = () => `${embeddingService.EMBEDDING_MODEL}@768`;
 
 /**
- * Index a single audit: build domain chunks, embed new/changed ones, upsert to MongoDB.
+ * Index a single audit: build domain chunks, embed new/changed ones, upsert to MongoDB
+ * using the complete stable chunk identity: { auditRef, domain, partIndex }.
  * Idempotent — safe to call multiple times on the same audit.
  *
- * @param {Object} audit — Mongoose doc or plain object with _id, victimId, auditId, timestamp and all assessment fields
+ * @param {Object} audit — Mongoose doc or plain object with _id, victimId, auditId, timestamp and assessment fields
  * @returns {Promise<{ success: boolean, indexed: number, skipped: number, failed: number, error?: string }>}
  */
 async function indexAudit(audit) {
-  if (!RAG_ENABLED) return { success: true, indexed: 0, skipped: 0, failed: 0, note: 'RAG disabled' };
+  if (!isRagEnabled()) return { success: true, indexed: 0, skipped: 0, failed: 0, note: 'RAG disabled' };
 
   const result = { success: true, indexed: 0, skipped: 0, failed: 0 };
+  const vectorEnabled = isVectorEnabled();
+  const currentEmbeddingVersion = vectorEnabled ? getEmbeddingVersion() : null;
 
   // Resolve victim data classification for privacy gate
   let dataClassification = audit.victimId?.dataClassification || audit.dataClassification;
@@ -38,15 +41,25 @@ async function indexAudit(audit) {
 
   const chunks = buildChunks(audit);
 
-  for (const chunk of chunks) {
-    const hash = computeContentHash(chunk.content);
+  // Group chunk part counts per domain to clean up stale subchunks if content shrank
+  const domainPartCounts = {};
+  for (const c of chunks) {
+    domainPartCounts[c.domain] = Math.max(domainPartCounts[c.domain] || 0, c.partCount);
+  }
 
-    // Check for existing chunk with same content hash and embedding version
-    const existing = await AuditEvidenceChunk.findOne({
+  for (const chunk of chunks) {
+    const hash = embeddingService.computeContentHash(chunk.content);
+    const chunkIdentity = {
       auditRef: audit._id,
       domain: chunk.domain,
+      partIndex: chunk.partIndex
+    };
+
+    // Check for existing chunk with identical identity, content hash and embedding version
+    const existing = await AuditEvidenceChunk.findOne({
+      ...chunkIdentity,
       contentHash: hash,
-      embeddingVersion: RAG_VECTOR_ENABLED ? EMBEDDING_VERSION : null
+      embeddingVersion: currentEmbeddingVersion
     });
 
     if (existing && existing.indexingStatus === 'completed') {
@@ -59,35 +72,43 @@ async function indexAudit(audit) {
     let embeddingDimensions = null;
     let embeddingVersion = null;
 
-    if (RAG_VECTOR_ENABLED) {
+    if (vectorEnabled) {
       try {
-        embedding = await embedDocument(chunk.content, privacyOptions);
-        embeddingModel = EMBEDDING_MODEL;
-        embeddingDimensions = EMBEDDING_DIMENSIONS;
-        embeddingVersion = EMBEDDING_VERSION;
+        embedding = await embeddingService.embedDocument(chunk.content, privacyOptions);
+        embeddingModel = embeddingService.EMBEDDING_MODEL;
+        embeddingDimensions = embeddingService.EMBEDDING_DIMENSIONS;
+        embeddingVersion = currentEmbeddingVersion;
       } catch (err) {
-        // Log without sensitive content
-        console.error(`[auditIndexingService] Embedding failed for domain=${chunk.domain} auditId=${audit.auditId}:`, err.message);
+        console.error(
+          `[auditIndexingService] Embedding failed for domain=${chunk.domain} part=${chunk.partIndex} auditId=${audit.auditId}:`,
+          err.message
+        );
         result.failed++;
-        // Still store the chunk without embedding for structured retrieval
+
+        // Store chunk without embedding for structured fallback and mark failed
         try {
           await AuditEvidenceChunk.findOneAndUpdate(
-            { auditRef: audit._id, domain: chunk.domain },
+            chunkIdentity,
             {
-              victimId: audit.victimId,
-              auditRef: audit._id,
-              auditId: audit.auditId,
-              domain: chunk.domain,
-              timestamp: audit.timestamp || new Date(),
-              content: chunk.content,
-              sourceFields: chunk.sourceFields,
-              contentHash: hash,
-              embedding: null,
-              embeddingModel: null,
-              embeddingDimensions: null,
-              embeddingVersion: null,
-              indexingStatus: 'failed',
-              indexingError: err.message.substring(0, 500)
+              $set: {
+                victimId: audit.victimId,
+                auditRef: audit._id,
+                auditId: audit.auditId,
+                domain: chunk.domain,
+                partIndex: chunk.partIndex,
+                partCount: chunk.partCount,
+                timestamp: audit.timestamp || new Date(),
+                content: chunk.content,
+                sourceFields: chunk.sourceFields,
+                sourceSegments: chunk.sourceSegments || [],
+                contentHash: hash,
+                embedding: null,
+                embeddingModel: null,
+                embeddingDimensions: null,
+                embeddingVersion: null,
+                indexingStatus: 'failed',
+                indexingError: err.message.substring(0, 500)
+              }
             },
             { upsert: true, new: true, setDefaultsOnInsert: true }
           );
@@ -100,29 +121,50 @@ async function indexAudit(audit) {
 
     try {
       await AuditEvidenceChunk.findOneAndUpdate(
-        { auditRef: audit._id, domain: chunk.domain },
+        chunkIdentity,
         {
-          victimId: audit.victimId,
-          auditRef: audit._id,
-          auditId: audit.auditId,
-          domain: chunk.domain,
-          timestamp: audit.timestamp || new Date(),
-          content: chunk.content,
-          sourceFields: chunk.sourceFields,
-          contentHash: hash,
-          embedding,
-          embeddingModel,
-          embeddingDimensions,
-          embeddingVersion,
-          indexingStatus: RAG_VECTOR_ENABLED ? 'completed' : 'pending',
-          indexingError: null
+          $set: {
+            victimId: audit.victimId,
+            auditRef: audit._id,
+            auditId: audit.auditId,
+            domain: chunk.domain,
+            partIndex: chunk.partIndex,
+            partCount: chunk.partCount,
+            timestamp: audit.timestamp || new Date(),
+            content: chunk.content,
+            sourceFields: chunk.sourceFields,
+            sourceSegments: chunk.sourceSegments || [],
+            contentHash: hash,
+            embedding,
+            embeddingModel,
+            embeddingDimensions,
+            embeddingVersion,
+            indexingStatus: vectorEnabled ? 'completed' : 'pending',
+            indexingError: null
+          }
         },
         { upsert: true, new: true, setDefaultsOnInsert: true }
       );
       result.indexed++;
     } catch (dbErr) {
-      console.error(`[auditIndexingService] DB upsert failed for domain=${chunk.domain}:`, dbErr.message);
+      console.error(
+        `[auditIndexingService] DB upsert failed for domain=${chunk.domain} part=${chunk.partIndex}:`,
+        dbErr.message
+      );
       result.failed++;
+    }
+  }
+
+  // Clean up any stale subchunks if an audit was re-evaluated with fewer parts
+  for (const [domain, maxPartCount] of Object.entries(domainPartCounts)) {
+    try {
+      await AuditEvidenceChunk.deleteMany({
+        auditRef: audit._id,
+        domain,
+        partIndex: { $gte: maxPartCount }
+      });
+    } catch {
+      // Non-critical cleanup
     }
   }
 
