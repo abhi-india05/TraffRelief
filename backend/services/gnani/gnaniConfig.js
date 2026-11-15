@@ -6,15 +6,19 @@ require('dotenv').config();
  * Manages configuration and endpoints for Gnani Prisma STT and Gnani Timbre TTS.
  */
 function getGnaniConfig() {
+  const isEnabled = process.env.GNANI_ENABLED === 'true' || process.env.MOCK_GNANI === 'false';
   return {
+    apiKeyId: process.env.GNANI_API_KEY_ID || process.env.GNANI_API_KEY || '',
     apiKey: process.env.GNANI_API_KEY || '',
-    enabled: process.env.GNANI_ENABLED === 'true',
+    baseUrl: process.env.GNANI_BASE_URL || 'https://api.vachana.ai',
+    enabled: isEnabled,
     allowRealData: process.env.GNANI_ALLOW_REAL_DATA === 'true',
+    mockGnani: process.env.MOCK_GNANI === 'true',
 
     // Prisma STT settings
     prisma: {
-      endpoint: process.env.GNANI_PRISMA_ENDPOINT || 'https://api.vachana.ai/stt/v3',
-      model: process.env.GNANI_PRISMA_MODEL || 'prisma-v3.0',
+      endpoint: process.env.GNANI_STT_URL || process.env.GNANI_PRISMA_ENDPOINT || 'https://api.vachana.ai/stt/v3',
+      model: process.env.GNANI_STT_MODEL || process.env.GNANI_PRISMA_MODEL || 'prisma-v2.5',
       language: process.env.GNANI_PRISMA_LANGUAGE || 'kn-IN',
       mode: process.env.GNANI_PRISMA_MODE || 'codemix',
       supportedMimeTypes: new Set([
@@ -34,10 +38,11 @@ function getGnaniConfig() {
 
     // Timbre TTS settings
     timbre: {
-      endpoint: process.env.GNANI_TIMBRE_ENDPOINT || 'https://api.gnani.ai/v1/tts/inference',
-      model: process.env.GNANI_TIMBRE_MODEL || 'timbre-2.5',
+      endpoint: process.env.GNANI_TTS_URL || process.env.GNANI_TIMBRE_ENDPOINT || 'https://api.vachana.ai/api/v1/tts/inference',
+      streamEndpoint: process.env.GNANI_TTS_STREAM_URL || 'https://api.vachana.ai/api/v1/tts/stream',
+      model: process.env.GNANI_TTS_MODEL || process.env.GNANI_TIMBRE_MODEL || 'timbre-v2.5',
       language: process.env.GNANI_TIMBRE_LANGUAGE || 'kn',
-      voice: process.env.GNANI_TIMBRE_VOICE || 'Kavin',
+      voice: process.env.GNANI_TTS_VOICE || process.env.GNANI_TIMBRE_VOICE || 'Lakshmi',
       sampleRate: parseInt(process.env.GNANI_TIMBRE_SAMPLE_RATE || '48000', 10),
       container: 'wav',
       encoding: 'linear_pcm'

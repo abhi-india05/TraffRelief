@@ -73,7 +73,7 @@ async function transcribeAudio(options = {}) {
   formData.append('format', config.prisma.mode);
 
   const headers = {
-    'X-API-Key-ID': config.apiKey,
+    'X-API-Key-ID': config.apiKeyId || config.apiKey,
     'x-api-key': config.apiKey
   };
 

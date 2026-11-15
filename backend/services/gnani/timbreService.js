@@ -78,7 +78,7 @@ async function getQuestionAudio(options = {}) {
 
     const headers = {
       'Content-Type': 'application/json',
-      'X-API-Key-ID': config.apiKey,
+      'X-API-Key-ID': config.apiKeyId || config.apiKey,
       'x-api-key': config.apiKey
     };
 
