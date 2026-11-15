@@ -7,19 +7,22 @@ const Admin = require("../models/admin");
 async function addAudit(req, res, next) {
   try {
     const { staffId, victimId } = req.params;
+    const { id: authUserId, role: authRole } = req.user || {};
+
+    if (!authRole || (authRole !== "staff" && authRole !== "admin")) {
+      return res.status(403).json({ error: "Unauthorized role" });
+    }
+
     if (!staffId || !victimId) {
       return res
         .status(400)
         .json({ error: "staffId and victimId parameters are required" });
     }
-    // Generate a new sequential auditId. Sort by _id (monotonic) to get the latest document.
-    let newAuditId = "AUD-101";
-    const lastAudit = await Audit.findOne().sort({ _id: -1 });
 
-    if (lastAudit && lastAudit.auditId) {
-      const parts = String(lastAudit.auditId).split("-");
-      const lastNum = parseInt(parts[1], 10) || 100;
-      newAuditId = `AUD-${lastNum + 1}`;
+    if (authRole === "staff" && authUserId !== staffId) {
+      return res
+        .status(403)
+        .json({ error: "Staff member identity mismatch" });
     }
 
     const staff = await Staff.findOne({ staffId: staffId });
@@ -31,6 +34,34 @@ async function addAudit(req, res, next) {
     if (!victim) {
       return res.status(404).json({ error: "Victim not found" });
     }
+
+    // Verify patient assignment
+    if (authRole === "staff") {
+      const isAssigned = victim.staff && victim.staff.toString() === staff._id.toString();
+      if (!isAssigned) {
+        return res
+          .status(403)
+          .json({ error: "You are not assigned to this victim" });
+      }
+    } else if (authRole === "admin") {
+      const admin = await Admin.findOne({ adminId: authUserId });
+      if (!admin || !victim.admin || victim.admin.toString() !== admin._id.toString()) {
+        return res
+          .status(403)
+          .json({ error: "Victim is not under your administrative scope" });
+      }
+    }
+
+    // Generate a new sequential auditId. Sort by _id (monotonic) to get the latest document.
+    let newAuditId = "AUD-101";
+    const lastAudit = await Audit.findOne().sort({ _id: -1 });
+
+    if (lastAudit && lastAudit.auditId) {
+      const parts = String(lastAudit.auditId).split("-");
+      const lastNum = parseInt(parts[1], 10) || 100;
+      newAuditId = `AUD-${lastNum + 1}`;
+    }
+
     req.body.submittedBy = staff._id;
     req.body.victimId = victim._id;
     req.body.auditId = newAuditId;

@@ -115,38 +115,66 @@ module.exports = mongoose.model('Audit', AuditSchema);
 const mongoose = require('mongoose');
 const { Schema } = mongoose;
 
+// Reusable sub-schema for per-domain RAG evidence references
+const evidenceReferenceSchema = new Schema({
+  auditId: String,
+  date: Date,
+  field: String,
+  observation: String,
+  sourceType: { type: String, enum: ['structured', 'semantic', 'safety'] }
+}, { _id: false });
+
 const ResultSchema = new Schema({
   domain_evaluations: {
     medical_physical: {
       status: {
         type: String,
-        enum: ["improving", "no_change", "declining"],
+        enum: ["improving", "no_change", "declining", "insufficient_data"],
         required: true
       },
       reasons: [{ type: String, required: true }],
-      evidence: [{ type: String, required: true }]
+      evidence: [{ type: String, required: true }],
+      // Extended RAG fields (new — existing [String] evidence preserved)
+      evidenceReferences: [evidenceReferenceSchema],
+      dataSufficiency: {
+        type: String,
+        enum: ['sufficient', 'limited', 'insufficient'],
+        default: 'sufficient'
+      }
     },
 
     trauma_indicators: {
       status: {
         type: String,
-        enum: ["improving", "no_change", "declining"],
+        enum: ["improving", "no_change", "declining", "insufficient_data"],
         required: true
       },
       reasons: [{ type: String, required: true }],
-      evidence: [{ type: String, required: true }]
+      evidence: [{ type: String, required: true }],
+      // Extended RAG fields
+      evidenceReferences: [evidenceReferenceSchema],
+      dataSufficiency: {
+        type: String,
+        enum: ['sufficient', 'limited', 'insufficient'],
+        default: 'sufficient'
+      }
     },
 
     progress_tracking: {
       status: {
         type: String,
-        enum: ["improving", "no_change", "declining"],
+        enum: ["improving", "no_change", "declining", "insufficient_data"],
         required: true
       },
-
-
       reasons: [{ type: String, required: true }],
-      evidence: [{ type: String, required: true }]
+      evidence: [{ type: String, required: true }],
+      // Extended RAG fields
+      evidenceReferences: [evidenceReferenceSchema],
+      dataSufficiency: {
+        type: String,
+        enum: ['sufficient', 'limited', 'insufficient'],
+        default: 'sufficient'
+      }
     }
   },
 
@@ -158,7 +186,16 @@ const ResultSchema = new Schema({
     default: false
   },
 
-  next_audit_date: { type: Date }
+  next_audit_date: { type: Date },
+
+  // Top-level RAG additions
+  requires_human_review: { type: Boolean, default: false },
+  retrievalMetadata: {
+    retrievalMode: { type: String, enum: ['structured_only', 'hybrid'], default: 'structured_only' },
+    embeddingModel: String,
+    retrievedAuditIds: [String],
+    evaluationVersion: String
+  }
 });
 
 const AuditSchema = new Schema(
@@ -212,7 +249,22 @@ const AuditSchema = new Schema(
     // new result field
     isFirst: { type: Boolean, default: false },
     result: { type: ResultSchema, default: null },
-    generatedResults: { type: Boolean, default: false }
+    generatedResults: { type: Boolean, default: false },
+
+    // RAG evaluation pipeline tracking
+    evaluationStatus: {
+      type: String,
+      enum: ['pending', 'processing', 'completed', 'failed', 'requires_review'],
+      default: 'pending'
+    },
+    evaluationError: { type: String, default: null },
+    evaluationVersion: { type: String, default: null },
+    indexingStatus: {
+      type: String,
+      enum: ['pending', 'processing', 'completed', 'failed'],
+      default: 'pending'
+    },
+    indexingError: { type: String, default: null }
   },
   {
     timestamps: { createdAt: 'timestamp', updatedAt: false } // ✅ correct place

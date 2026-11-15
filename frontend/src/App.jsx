@@ -179,7 +179,11 @@ function App() {
         />
         <Route
           path="/interview-results/:hashId"
-          element={<InterviewResultsPage />}
+          element={
+            <PrivateRoute>
+              <InterviewResultsPage />
+            </PrivateRoute>
+          }
         />
         <Route path="*" element={<PageNotFound />} />
       </Routes>

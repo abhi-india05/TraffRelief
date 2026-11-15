@@ -1,6 +1,8 @@
 const router = require('express').Router();
 const {handleAddStaff, viewStaffs, getActivityLogs, markAllNotificationsRead, getVictimDetails, addVictim, getUnassignedVictims, assignVictims,getAllAudits, getAdminDetails, getStaffAudits, releaseVictim, verifyInitialDetails, discardInitialDetails} = require('../controllers/admin.js');
 const { getAuditDetails, getVictimAuditHistory } = require('../controllers/audit.js');
+const { retryAuditEvaluation } = require('../controllers/gemini.js');
+const { getVictimInterventions, updateIntervention } = require('../controllers/intervention.js');
 const { verifyToken } = require('../middlewares/authentication.js');
 const upload = require('../middlewares/upload');
 const { uploadCloud } = require('../utils/cloudinary.js');
@@ -21,5 +23,10 @@ router.get('/:victimId/audit-history', verifyToken, getVictimAuditHistory);
 router.patch('/release-victim/:victimId', verifyToken, releaseVictim);
 router.patch("/verify-initial-details/:victimId", verifyToken, verifyInitialDetails);
 router.delete("/discard-initial-details/:victimId", verifyToken, discardInitialDetails);
+
+// Evaluation retry and intervention routes
+router.post('/audit/:auditId/retry-evaluation', verifyToken, retryAuditEvaluation);
+router.get('/interventions/:victimId', verifyToken, getVictimInterventions);
+router.patch('/interventions/:interventionId', verifyToken, updateIntervention);
 
 module.exports = router;
