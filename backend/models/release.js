@@ -51,8 +51,43 @@ suicidal:String
    verdict:{
     type:String,
     default:null
-
-}}
+   },
+   interviewLanguage: {
+    type: String,
+    enum: ['en', 'kn'],
+    default: 'en'
+   },
+   transcriptionProvider: {
+    type: String,
+    enum: ['gemini', 'gnani_prisma'],
+    default: 'gemini'
+   },
+   transcriptionModel: {
+    type: String,
+    default: null
+   },
+   transcriptionMode: {
+    type: String,
+    default: null
+   },
+   detectedLanguage: {
+    type: String,
+    default: null
+   },
+   analysisLanguage: {
+    type: String,
+    default: 'en'
+   },
+   processingStatus: {
+    type: String,
+    enum: ['pending', 'processing', 'completed', 'failed'],
+    default: 'pending'
+   },
+   processingError: {
+    type: String,
+    default: null
+   }
+}
 );
 
    module.exports=mongoose.model("Release",releaseSchema);

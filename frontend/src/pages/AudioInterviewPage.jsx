@@ -2,20 +2,25 @@ import { useEffect, useRef, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import { toast } from 'react-toastify'
 import Footer from '../components/Footer'
+import { INTERVIEW_QUESTIONS } from '../services/interviewQuestions'
 
 // Audio Interview Page
-// - Five questions appear one-by-one
+// - Five questions appear one-by-one with bilingual support (English / Kannada)
+// - Kannada questions support voice playback via Gnani Timbre TTS
 // - Single MediaRecorder instance used across all questions
+// - Preserves genuine audio MIME type (WebM, Ogg, MP3, etc.)
 // - Pause (between questions) and resume (for next question) append audio
 // - After final stop the entire audio blob is saved locally (IndexedDB) and can be uploaded
 
-const QUESTIONS = [
-  'How has your energy been lately? For example, have you been feeling rested when you wake up, or more tired than usual?',
-  'What has been taking up most of your attention or focus recently?',
-  'What’s something you’ve done in the last few days that you genuinely enjoyed or found interesting?',
-  'What are you looking forward to in the next few days or weeks?',
-  'How have interactions with other people felt for you recently?'
-]
+function getExtensionFromMime(mime) {
+  const m = (mime || '').toLowerCase()
+  if (m.includes('webm')) return '.webm'
+  if (m.includes('ogg')) return '.ogg'
+  if (m.includes('wav')) return '.wav'
+  if (m.includes('mp4') || m.includes('m4a')) return '.mp4'
+  if (m.includes('mp3') || m.includes('mpeg')) return '.mp3'
+  return '.webm'
+}
 
 // --- Lightweight IndexedDB helpers (no external libs) ---
 function openAudioDB() {
@@ -65,17 +70,21 @@ async function deleteBlobFromIDB(key) {
 
 export default function AudioInterviewPage() {
   const { hashId } = useParams()
-  console.log('AudioInterviewPage mounting with hashId:', hashId)
   const [currentQuestion, setCurrentQuestion] = useState(0) // 0..4
+  const [selectedLanguage, setSelectedLanguage] = useState('en') // 'en' | 'kn'
   const [recordingStatus, setRecordingStatus] = useState('idle') // 'idle' | 'recording' | 'paused' | 'ended' | 'permission-denied'
   const [isUploading, setIsUploading] = useState(false)
   const [savedExists, setSavedExists] = useState(false)
   const [savedUrl, setSavedUrl] = useState(null)
+  const [savedMime, setSavedMime] = useState('audio/webm')
+  const [ttsPlaying, setTtsPlaying] = useState(false)
+  const [ttsLoading, setTtsLoading] = useState(false)
 
   const mediaRecorderRef = useRef(null)
   const mediaStreamRef = useRef(null)
   const audioChunksRef = useRef([]) // will hold all chunks across questions
   const advanceTimerRef = useRef(null)
+  const ttsAudioRef = useRef(null)
   const SAVED_KEY = 'answers-complete'
 
   // helper to pick a supported mimeType
@@ -93,12 +102,24 @@ export default function AudioInterviewPage() {
     return candidates.find((t) => MediaRecorder.isTypeSupported(t)) || ''
   }
 
+  const stopTtsPlayback = () => {
+    if (ttsAudioRef.current) {
+      try {
+        ttsAudioRef.current.pause()
+        ttsAudioRef.current.currentTime = 0
+      } catch (e) {
+        // ignore
+      }
+      ttsAudioRef.current = null
+    }
+    setTtsPlaying(false)
+    setTtsLoading(false)
+  }
+
   // request microphone and create MediaRecorder once when user first starts
   const initMediaRecorder = async (forcePrompt = false) => {
     if (mediaRecorderRef.current) return
     try {
-      // If permission was previously denied in browser UI, calling getUserMedia may not prompt again.
-      // forcePrompt parameter allows calling when user clicks "Allow Microphone" retry button.
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       mediaStreamRef.current = stream
 
@@ -109,12 +130,13 @@ export default function AudioInterviewPage() {
       mr.ondataavailable = (e) => {
         if (e.data && e.data.size > 0) {
           audioChunksRef.current.push(e.data)
-          console.log('chunk received', e.data.size)
         }
       }
 
       mr.onstop = async () => {
-        const completeBlob = new Blob(audioChunksRef.current, { type: 'audio/mp3' })
+        const actualMime = mr.mimeType || mimeType || 'audio/webm'
+        const completeBlob = new Blob(audioChunksRef.current, { type: actualMime })
+        setSavedMime(actualMime)
         try {
           await saveBlobToIDB(SAVED_KEY, completeBlob)
           setSavedExists(true)
@@ -137,11 +159,9 @@ export default function AudioInterviewPage() {
       }
 
       mediaRecorderRef.current = mr
-      // if we previously set permission-denied, revert to idle so user can start
       if (recordingStatus === 'permission-denied') setRecordingStatus('idle')
     } catch (err) {
       console.error('Microphone permission or creation failed', err)
-      // Specifically handle permission denial
       if (err && (err.name === 'NotAllowedError' || err.name === 'SecurityError' || err.name === 'PermissionDeniedError')) {
         setRecordingStatus('permission-denied')
         toast.error('Microphone permission denied. Click "Allow Microphone" or enable microphone access in browser/site settings.')
@@ -154,12 +174,16 @@ export default function AudioInterviewPage() {
     }
   }
 
-  // start or resume recording
+  // start or resume recording (always ensure TTS audio is stopped so question is not recorded)
   const startRecording = async () => {
     if (recordingStatus === 'permission-denied') {
       toast.error('Microphone permission denied. Click "Allow Microphone" and retry.')
       return
     }
+
+    // Stop question audio playback immediately
+    stopTtsPlayback()
+
     try {
       await initMediaRecorder()
     } catch (err) {
@@ -189,7 +213,8 @@ export default function AudioInterviewPage() {
       setRecordingStatus('paused')
 
       advanceTimerRef.current = setTimeout(() => {
-        setCurrentQuestion((idx) => Math.min(4, idx + 1))
+        stopTtsPlayback()
+        setCurrentQuestion((idx) => Math.min(INTERVIEW_QUESTIONS.length - 1, idx + 1))
       }, 2000)
     } catch (err) {
       console.error('Pause failed', err)
@@ -198,6 +223,7 @@ export default function AudioInterviewPage() {
   }
 
   const stopSessionAndSave = async () => {
+    stopTtsPlayback()
     const mr = mediaRecorderRef.current
     if (!mr) return
     try {
@@ -211,19 +237,67 @@ export default function AudioInterviewPage() {
     }
   }
 
+  const handleTtsPlayback = async () => {
+    if (ttsPlaying) {
+      stopTtsPlayback()
+      return
+    }
+
+    try {
+      setTtsLoading(true)
+      const q = INTERVIEW_QUESTIONS[currentQuestion]
+      const questionId = q ? q.id : `q${currentQuestion + 1}`
+      const url = `http://localhost:5000/staff/release/${hashId}/question-audio/${questionId}?lang=kn`
+
+      if (ttsAudioRef.current) {
+        ttsAudioRef.current.pause()
+      }
+
+      const audio = new Audio(url)
+      ttsAudioRef.current = audio
+
+      audio.onended = () => {
+        setTtsPlaying(false)
+        setTtsLoading(false)
+      }
+
+      audio.onerror = (e) => {
+        console.warn('TTS question audio load error:', e)
+        setTtsPlaying(false)
+        setTtsLoading(false)
+        toast.warn('Question audio unavailable. Please read the question on screen.')
+      }
+
+      await audio.play()
+      setTtsPlaying(true)
+    } catch (err) {
+      console.warn('TTS play error:', err)
+      toast.warn('Audio playback not supported or unavailable')
+    } finally {
+      setTtsLoading(false)
+    }
+  }
+
   const uploadAudioBlob = async (blobToUpload) => {
     try {
       setIsUploading(true)
+      const actualType = blobToUpload.type || savedMime || 'audio/webm'
+      const ext = getExtensionFromMime(actualType)
       const formData = new FormData()
-      formData.append('audio', blobToUpload)
-      formData.append('questionsCount', QUESTIONS.length)
+      formData.append('audio', blobToUpload, `interview-recording${ext}`)
+      formData.append('mimeType', actualType)
+      formData.append('language', selectedLanguage)
+      formData.append('questionsCount', INTERVIEW_QUESTIONS.length)
 
       const token = localStorage.getItem('token')
+      const headers = {}
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`
+      }
+
       const res = await fetch(`http://localhost:5000/staff/${hashId}`, {
         method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${token}`
-        },
+        headers,
         body: formData
       })
 
@@ -242,10 +316,8 @@ export default function AudioInterviewPage() {
     }
   }
 
-  // handle the single record button click (toggles behavior per spec)
   const handleRecordButton = async () => {
     if (recordingStatus === 'permission-denied') {
-      // attempt a user-initiated retry (some browsers will re-prompt)
       try {
         await initMediaRecorder(true)
         toast.info('If prompted, allow microphone for this site.')
@@ -261,7 +333,7 @@ export default function AudioInterviewPage() {
     }
 
     if (recordingStatus === 'recording') {
-      if (currentQuestion === QUESTIONS.length - 1) {
+      if (currentQuestion === INTERVIEW_QUESTIONS.length - 1) {
         if (advanceTimerRef.current) {
           clearTimeout(advanceTimerRef.current)
           advanceTimerRef.current = null
@@ -293,6 +365,7 @@ export default function AudioInterviewPage() {
       const blob = await getBlobFromIDB(SAVED_KEY)
       if (blob) {
         setSavedExists(true)
+        setSavedMime(blob.type || 'audio/webm')
         const url = URL.createObjectURL(blob)
         setSavedUrl(url)
       } else {
@@ -322,7 +395,6 @@ export default function AudioInterviewPage() {
     }
   }
 
-  // upload the locally-saved blob (if exists)
   const uploadLocalCopy = async () => {
     try {
       const blob = await getBlobFromIDB(SAVED_KEY)
@@ -338,6 +410,7 @@ export default function AudioInterviewPage() {
   useEffect(() => {
     loadLocalSavedBlob()
     return () => {
+      stopTtsPlayback()
       if (advanceTimerRef.current) clearTimeout(advanceTimerRef.current)
       if (mediaStreamRef.current) {
         mediaStreamRef.current.getTracks().forEach((t) => t.stop())
@@ -352,61 +425,146 @@ export default function AudioInterviewPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Label logic for button
   const buttonLabel = (() => {
     if (recordingStatus === 'permission-denied') return 'Allow Microphone'
     if (recordingStatus === 'idle') return 'Start Recording'
-    if (recordingStatus === 'recording') return currentQuestion === QUESTIONS.length - 1 ? 'Stop Recording' : 'Stop Recording'
+    if (recordingStatus === 'recording') return currentQuestion === INTERVIEW_QUESTIONS.length - 1 ? 'Stop Recording' : 'Stop Recording'
     if (recordingStatus === 'paused') return 'Start Recording'
     if (recordingStatus === 'ended') return 'Session Ended'
     return 'Record'
   })()
+
+  const currentQ = INTERVIEW_QUESTIONS[currentQuestion] || {}
 
   return (
     <main className="w-full min-h-screen font-['QuickSand'] bg-stone-100 pt-20">
       <div className="p-8 flex flex-col gap-8">
         <div className="max-w-4xl mx-auto bg-[#FCF6F5] rounded-2xl shadow p-8 border-2" style={{ borderColor: '#990011' }}>
 
-          <h1 className="text-3xl font-medium text-[#990011] mb-2">Audio Interview</h1>
-          <p className="text-sm text-gray-600 mb-6">Answer the five questions using audio. Your answers will be recorded into a single audio file. The recording is saved locally after finishing so you can preview or retry upload.</p>
-
-          <div className="flex items-center justify-between mb-4">
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-4">
             <div>
-              <p className="text-lg font-semibold">Question {currentQuestion + 1} of {QUESTIONS.length}</p>
-              <p className="text-2xl font-bold text-[#990011]">{QUESTIONS[currentQuestion]}</p>
+              <h1 className="text-3xl font-medium text-[#990011]">Audio Interview</h1>
+              <p className="text-sm text-gray-600 mt-1">
+                Answer the five questions using audio in English or Kannada. Recordings are transcribed and evaluated for rehabilitation follow-up.
+              </p>
             </div>
-            <div className="text-right">
-              <p className="italic font-serif text-sm text-gray-700">Click the record button below to start answering.</p>
-              <div className="mt-3">
-                <button
-                  onClick={handleRecordButton}
-                  disabled={recordingStatus === 'ended' || isUploading}
-                  className={`px-6 py-3 rounded-full font-semibold shadow-lg focus:outline-none transform transition-transform ${recordingStatus === 'recording' ? 'animate-pulse scale-105' : 'hover:scale-105'}`}
-                  style={{ backgroundColor: '#990011', color: '#FCF6F5' }}
-                >
-                  {buttonLabel}
-                </button>
-              </div>
+
+            {/* Language Switcher */}
+            <div className="flex items-center gap-2 bg-white px-3 py-1.5 rounded-full border shadow-sm">
+              <span className="text-xs font-semibold text-gray-500 uppercase">Language:</span>
+              <button
+                type="button"
+                onClick={() => {
+                  if (recordingStatus === 'recording') return
+                  stopTtsPlayback()
+                  setSelectedLanguage('en')
+                }}
+                disabled={recordingStatus === 'recording'}
+                className={`px-3 py-1 text-xs font-medium rounded-full transition-all ${
+                  selectedLanguage === 'en'
+                    ? 'bg-[#990011] text-[#FCF6F5] shadow-sm'
+                    : 'text-gray-700 hover:text-[#990011]'
+                }`}
+              >
+                English
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (recordingStatus === 'recording') return
+                  stopTtsPlayback()
+                  setSelectedLanguage('kn')
+                }}
+                disabled={recordingStatus === 'recording'}
+                className={`px-3 py-1 text-xs font-medium rounded-full transition-all ${
+                  selectedLanguage === 'kn'
+                    ? 'bg-[#990011] text-[#FCF6F5] shadow-sm'
+                    : 'text-gray-700 hover:text-[#990011]'
+                }`}
+              >
+                ಕನ್ನಡ (Kannada)
+              </button>
             </div>
           </div>
 
-          <div className="mt-6">
-            <div className="p-4 rounded-lg border" style={{ borderColor: '#990011' }}>
-              <p className="text-sm text-gray-700">Status: <strong>{recordingStatus}</strong></p>
-              <p className="text-sm text-gray-700">{recordingStatus === 'recording' ? 'Recording...' : recordingStatus === 'paused' ? 'Paused between questions' : ''}</p>
-              {recordingStatus === 'permission-denied' && (
-                <p className="text-sm text-red-600">Microphone access is blocked. Please enable microphone for this site in browser settings or click "Allow Microphone".</p>
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-6 mb-6 pt-4 border-t border-gray-200">
+            <div className="flex-1">
+              <p className="text-xs font-bold uppercase tracking-wider text-gray-500 mb-1">
+                Question {currentQuestion + 1} of {INTERVIEW_QUESTIONS.length}
+              </p>
+              <p className="text-2xl font-bold text-[#990011] leading-relaxed">
+                {selectedLanguage === 'kn' ? currentQ.kn : currentQ.en}
+              </p>
+              {selectedLanguage === 'kn' && (
+                <p className="text-xs text-gray-500 mt-1 italic font-sans">
+                  {currentQ.en}
+                </p>
               )}
-              {isUploading && <p className="text-sm text-gray-700">Processing...</p>}
+
+              {/* Kannada Voice Playback (Gnani Timbre TTS) */}
+              {selectedLanguage === 'kn' && (
+                <div className="mt-3">
+                  <button
+                    type="button"
+                    onClick={handleTtsPlayback}
+                    disabled={recordingStatus === 'recording' || ttsLoading}
+                    className="inline-flex items-center gap-2 px-3.5 py-1.5 text-xs font-semibold rounded-lg border-2 border-[#990011] text-[#990011] hover:bg-[#990011] hover:text-[#FCF6F5] transition-all disabled:opacity-40"
+                    title="Gnani Timbre TTS Voice Assistance"
+                  >
+                    {ttsLoading ? (
+                      <span>⏳ ಧ್ವನಿ ಲೋಡ್ ಆಗುತ್ತಿದೆ... (Loading...)</span>
+                    ) : ttsPlaying ? (
+                      <span>⏹️ ಧ್ವನಿ ನಿಲ್ಲಿಸಿ (Stop Audio)</span>
+                    ) : (
+                      <span>🔊 ಪ್ರಶ್ನೆ ಕೇಳಿ (Listen in Kannada)</span>
+                    )}
+                  </button>
+                </div>
+              )}
+            </div>
+
+            <div className="text-left md:text-right flex flex-col items-start md:items-end">
+              <p className="italic font-serif text-xs text-gray-600 mb-2">
+                Click button to start answering:
+              </p>
+              <button
+                onClick={handleRecordButton}
+                disabled={recordingStatus === 'ended' || isUploading}
+                className={`px-6 py-3 rounded-full font-semibold shadow-lg focus:outline-none transform transition-transform ${
+                  recordingStatus === 'recording' ? 'animate-pulse scale-105' : 'hover:scale-105'
+                }`}
+                style={{ backgroundColor: '#990011', color: '#FCF6F5' }}
+              >
+                {buttonLabel}
+              </button>
+            </div>
+          </div>
+
+          <div className="mt-4">
+            <div className="p-4 rounded-lg border bg-white" style={{ borderColor: '#990011' }}>
+              <p className="text-sm text-gray-700">Status: <strong>{recordingStatus}</strong></p>
+              <p className="text-sm text-gray-700">
+                {recordingStatus === 'recording'
+                  ? 'Recording your voice... Speak clearly.'
+                  : recordingStatus === 'paused'
+                  ? 'Paused between questions. Preparing next question...'
+                  : ''}
+              </p>
+              {recordingStatus === 'permission-denied' && (
+                <p className="text-sm text-red-600 mt-1">
+                  Microphone access is blocked. Please enable microphone for this site in browser settings or click "Allow Microphone".
+                </p>
+              )}
+              {isUploading && <p className="text-sm text-gray-700 mt-1">Processing and uploading interview recording...</p>}
             </div>
           </div>
 
           <div className="mt-6">
             <div className="grid grid-cols-1 gap-3">
               <div className="flex gap-2 items-center">
-                <span className="text-sm font-semibold">Local copy:</span>
+                <span className="text-sm font-semibold">Local recording copy:</span>
                 {savedExists ? (
-                  <span className="text-sm text-green-700">Saved</span>
+                  <span className="text-sm font-medium text-green-700">Available locally ({savedMime})</span>
                 ) : (
                   <span className="text-sm text-slate-600">None</span>
                 )}
@@ -416,9 +574,19 @@ export default function AudioInterviewPage() {
                 <div className="flex flex-col gap-2">
                   <audio controls src={savedUrl} className="w-full" />
                   <div className="flex gap-2">
-                    <button onClick={uploadLocalCopy} className="px-4 py-2 rounded bg-[#990011] text-[#FCF6F5]">Upload</button>
-                    <button onClick={deleteLocalSavedBlob} className="px-4 py-2 rounded border">Clear Local Copy</button>
-                    <a href={savedUrl} download="answers.mp3" className="px-4 py-2 rounded border">Download</a>
+                    <button onClick={uploadLocalCopy} className="px-4 py-2 rounded bg-[#990011] text-[#FCF6F5]">
+                      Upload
+                    </button>
+                    <button onClick={deleteLocalSavedBlob} className="px-4 py-2 rounded border bg-white">
+                      Clear Local Copy
+                    </button>
+                    <a
+                      href={savedUrl}
+                      download={`answers${getExtensionFromMime(savedMime)}`}
+                      className="px-4 py-2 rounded border bg-white"
+                    >
+                      Download
+                    </a>
                   </div>
                 </div>
               )}
@@ -427,8 +595,18 @@ export default function AudioInterviewPage() {
 
           <div className="mt-6">
             <div className="grid grid-cols-5 gap-2">
-              {QUESTIONS.map((q, i) => (
-                <div key={i} className={`p-2 text-xs text-center rounded ${i < currentQuestion ? 'bg-[#990011] text-[#FCF6F5]' : i === currentQuestion ? 'border-2' : 'bg-white'} shadow-sm`} style={{ borderColor: '#990011' }}>
+              {INTERVIEW_QUESTIONS.map((q, i) => (
+                <div
+                  key={q.id || i}
+                  className={`p-2 text-xs text-center rounded transition-all ${
+                    i < currentQuestion
+                      ? 'bg-[#990011] text-[#FCF6F5]'
+                      : i === currentQuestion
+                      ? 'border-2 font-bold'
+                      : 'bg-white'
+                  } shadow-sm`}
+                  style={{ borderColor: '#990011' }}
+                >
                   Q{i + 1}
                 </div>
               ))}
@@ -438,7 +616,9 @@ export default function AudioInterviewPage() {
         </div>
 
         <div className="max-w-4xl mx-auto">
-          <p className="text-sm text-gray-600">Note: This page uses the browser's MediaRecorder API and IndexedDB to store the final recording locally. Make sure your browser supports both and microphone permission is allowed.</p>
+          <p className="text-xs text-gray-500 text-center">
+            Note: All responses are processed securely. Kannada recordings are transcribed via Gnani Prisma STT with code-mix support and evaluated for follow-up rehabilitation support.
+          </p>
         </div>
       </div>
 

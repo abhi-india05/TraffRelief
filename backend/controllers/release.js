@@ -16,6 +16,9 @@ const Release = require("../models/release.js");
 const Staff = require("../models/staff.js");
 const Victim = require("../models/victim.js");
 const Admin = require("../models/admin.js");
+const prismaService = require("../services/gnani/prismaService");
+const timbreService = require("../services/gnani/timbreService");
+const { getQuestionById } = require("../services/gnani/interviewQuestions");
 
 const createRelease = async (req, res) => {
   try {
@@ -84,6 +87,7 @@ const createRelease = async (req, res) => {
 };
 
 async function submitRelease(req, res) {
+  let audioPath = null;
   try {
     const { hashId } = req.params;
     if (!hashId) {
@@ -94,14 +98,14 @@ async function submitRelease(req, res) {
       return res.status(400).json({ error: "Audio file is required (field name: 'audio')" });
     }
 
+    audioPath = req.file.path;
+
     // find release record and associated victim FIRST before invoking AI
     const releaseRecord = await Release.findOne({ hashLink: hashId }).populate("victimId");
     if (!releaseRecord) {
-      try { fs.unlinkSync(req.file.path); } catch (e) { /* ignore */ }
       return res.status(404).json({ error: "Release record not found" });
     }
     if (releaseRecord.submitted) {
-      try { fs.unlinkSync(req.file.path); } catch (e) { /* ignore */ }
       return res.status(400).json({ error: "Release has already been submitted" });
     }
 
@@ -109,54 +113,110 @@ async function submitRelease(req, res) {
     const dataClassification = victim?.dataClassification || "real";
     const databaseName = mongoose.connection?.name || "";
 
-    // Enforce privacy gate before audio transcription
-    assertGeminiDataAccess({
-      operation: "audio_transcription",
-      dataClassification,
-      databaseName
-    });
+    // Read audio buffer
+    const audioBuffer = fs.readFileSync(audioPath);
+    const audioMimeType = (req.body.mimeType || req.file.mimetype || 'audio/webm').split(';')[0].trim().toLowerCase();
+    const interviewLanguage = (req.body.language || req.body.interviewLanguage || 'en').toLowerCase().trim();
 
-    const audioPath = req.file.path;
+    let transcript = '';
+    let summary = '';
+    let provider = 'gemini';
+    let transcriptionModel = null;
+    let transcriptionMode = null;
+    let detectedLanguage = null;
 
-    // read and delete uploaded file
-    const audioBytes = fs.readFileSync(audioPath).toString("base64");
-    try { fs.unlinkSync(audioPath); } catch (e) { /* ignore */ }
+    if (interviewLanguage === 'kn') {
+      // --- KANNADA INTERVIEW PIPELINE (Gnani Prisma STT + Gemini Summary) ---
+      provider = 'gnani_prisma';
 
-    // Transcription
-    const transcriptionPrompt = "Transcribe this audio accurately in English. If it's another Indian language, translate it to English.";
+      const prismaResult = await prismaService.transcribeAudio({
+        audioBuffer,
+        mimeType: audioMimeType,
+        filename: req.file.originalname || `recording.${audioMimeType.split('/')[1] || 'webm'}`,
+        dataClassification,
+        patientId: victim?._id
+      });
 
-    const transcriptionResult = await model.generateContent([
-      { text: transcriptionPrompt },
-      { inlineData: { mimeType: "audio/mp3", data: audioBytes } },
-    ]);
+      transcript = prismaResult.transcript;
+      transcriptionModel = prismaResult.model;
+      transcriptionMode = prismaResult.mode;
+      detectedLanguage = prismaResult.language;
 
-    const transcript = transcriptionResult.response.text().trim();
-    console.log("[submitRelease] Transcription completed (length: %d chars)", transcript.length);
+      if (!transcript || transcript.trim() === '') {
+        return res.status(422).json({
+          error: "Prisma STT produced an empty transcription for the Kannada interview audio."
+        });
+      }
 
-    // Enforce privacy gate and sanitize text before summarization
-    assertGeminiDataAccess({
-      operation: "audio_summarization",
-      dataClassification,
-      databaseName
-    });
+      console.log("[submitRelease] Kannada transcription completed via Prisma STT (length: %d chars)", transcript.length);
 
-    const sanitizedTranscript = sanitizeClinicalText(transcript);
-    const summarizationPrompt = `Summarize this text in one emotionally-aware English sentence. Keep distress or emotion keywords intact.\nText: "${sanitizedTranscript}"`;
+      // Translate and summarize Kannada transcript to English for the downstream classifier
+      assertGeminiDataAccess({
+        operation: "audio_summarization",
+        dataClassification,
+        databaseName
+      });
 
-    const summaryResult = await model.generateContent([{ text: summarizationPrompt }]);
-    const summary = summaryResult.response.text().trim();
-    console.log("[submitRelease] Summary generated (length: %d chars)", summary.length);
+      const sanitizedTranscript = sanitizeClinicalText(transcript);
+      const translationSummarizationPrompt = `Translate and summarize this Kannada interview transcript into a single emotionally-aware English sentence. Retain distress and emotional expressions faithfully without inventing details or diagnosing.\nTranscript: "${sanitizedTranscript}"`;
 
-    // BERT / classification
+      const summaryResult = await model.generateContent([{ text: translationSummarizationPrompt }]);
+      summary = summaryResult.response.text().trim();
+      console.log("[submitRelease] Kannada-to-English summary generated (length: %d chars)", summary.length);
+
+    } else {
+      // --- ENGLISH INTERVIEW PIPELINE (Gemini STT + Gemini Summary) ---
+      provider = 'gemini';
+      transcriptionModel = 'gemini-2.0-flash';
+
+      assertGeminiDataAccess({
+        operation: "audio_transcription",
+        dataClassification,
+        databaseName
+      });
+
+      const transcriptionPrompt = "Transcribe this audio accurately in English.";
+
+      const transcriptionResult = await model.generateContent([
+        { text: transcriptionPrompt },
+        { inlineData: { mimeType: audioMimeType, data: audioBuffer.toString("base64") } },
+      ]);
+
+      transcript = transcriptionResult.response.text().trim();
+      console.log("[submitRelease] English transcription completed via Gemini (length: %d chars)", transcript.length);
+
+      assertGeminiDataAccess({
+        operation: "audio_summarization",
+        dataClassification,
+        databaseName
+      });
+
+      const sanitizedTranscript = sanitizeClinicalText(transcript);
+      const summarizationPrompt = `Summarize this text in one emotionally-aware English sentence. Keep distress or emotion keywords intact.\nText: "${sanitizedTranscript}"`;
+
+      const summaryResult = await model.generateContent([{ text: summarizationPrompt }]);
+      summary = summaryResult.response.text().trim();
+      console.log("[submitRelease] English summary generated (length: %d chars)", summary.length);
+    }
+
+    // BERT / classification using English summary
     const bertResp = await axios.post(BERT_URL, { text: summary });
     const result = bertResp.data;
-    console.log("[submitRelease] BERT Analysis completed successfully");
+    console.log("[submitRelease] Sentiment analysis completed");
 
     // ensure results object exists
     releaseRecord.submitted = true;
     releaseRecord.submittedTime = Date.now();
-    releaseRecord.transcription = transcript;
-    releaseRecord.summary = summary;
+    releaseRecord.transcription = transcript; // Original script (Kannada or English)
+    releaseRecord.summary = summary; // English analysis summary
+    releaseRecord.interviewLanguage = interviewLanguage === 'kn' ? 'kn' : 'en';
+    releaseRecord.transcriptionProvider = provider;
+    releaseRecord.transcriptionModel = transcriptionModel;
+    releaseRecord.transcriptionMode = transcriptionMode;
+    releaseRecord.detectedLanguage = detectedLanguage;
+    releaseRecord.analysisLanguage = 'en';
+    releaseRecord.processingStatus = 'completed';
+    releaseRecord.processingError = null;
     releaseRecord.results = releaseRecord.results || {};
 
     // map BERT scores into results safely
@@ -194,8 +254,66 @@ async function submitRelease(req, res) {
 
     return res.status(200).json({ message: "Release submitted successfully", release: releaseRecord });
   } catch (error) {
-    console.error("Error submitting release:", error);
-    res.status(500).json({ error: "Internal server error" });
+    console.error("Error submitting release:", error.message || error);
+    res.status(500).json({ error: error.message || "Internal server error" });
+  } finally {
+    // Guaranteed cleanup of uploaded temporary audio file
+    if (audioPath) {
+      try {
+        if (fs.existsSync(audioPath)) {
+          fs.unlinkSync(audioPath);
+        }
+      } catch (e) {
+        // ignore unlink error
+      }
+    }
+  }
+}
+
+async function getQuestionAudio(req, res) {
+  try {
+    const { questionId, hashId } = req.params;
+    const { lang = 'kn' } = req.query;
+
+    if (hashId) {
+      const releaseRecord = await Release.findOne({ hashLink: hashId });
+      if (!releaseRecord) {
+        return res.status(404).json({ error: "Release record not found" });
+      }
+      if (releaseRecord.submitted) {
+        return res.status(400).json({ error: "Interview has already been submitted" });
+      }
+    }
+
+    const normalizedLang = (lang || 'kn').toLowerCase();
+    if (normalizedLang !== 'kn') {
+      return res.status(400).json({ error: 'Question audio synthesis is currently supported for "kn" (Kannada).' });
+    }
+
+    const question = getQuestionById(questionId);
+    if (!question) {
+      return res.status(400).json({ error: `Invalid question ID "${questionId}". Must be one of q1 through q5.` });
+    }
+
+    const ttsResult = await timbreService.getQuestionAudio({
+      questionId: question.id,
+      language: normalizedLang
+    });
+
+    res.set({
+      'Content-Type': ttsResult.contentType || 'audio/wav',
+      'Content-Length': ttsResult.audioBuffer.length,
+      'Cache-Control': 'public, max-age=86400',
+      'X-Audio-From-Cache': String(ttsResult.fromCache)
+    });
+
+    return res.status(200).send(ttsResult.audioBuffer);
+  } catch (err) {
+    console.warn('[getQuestionAudio] Question audio playback unavailable:', err.message);
+    return res.status(503).json({
+      error: "Question audio playback currently unavailable",
+      details: err.message
+    });
   }
 }
 
@@ -290,4 +408,10 @@ async function viewReleaseByVictim(req, res) {
   }
 }
 // ...existing code...
-module.exports = { createRelease, submitRelease, viewReleaseResults, viewReleaseByVictim };
+module.exports = {
+  createRelease,
+  submitRelease,
+  viewReleaseResults,
+  viewReleaseByVictim,
+  getQuestionAudio
+};

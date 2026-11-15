@@ -27,7 +27,8 @@ const {
   createRelease,
   submitRelease,
   viewReleaseResults,
-  viewReleaseByVictim
+  viewReleaseByVictim,
+  getQuestionAudio
 } = require("../controllers/release.js");
 const { verifyToken } = require('../middlewares/authentication.js');
 const { uploadCloud } = require("../utils/cloudinary.js");
@@ -45,6 +46,8 @@ router.get('/:staffId/:victimId/view-release', verifyToken, viewReleaseByVictim)
 router.get('/:victimId/view-release', verifyToken, viewReleaseByVictim);
 router.post("/release/:hashId/submit", upload.single("audio"), submitRelease);
 router.get("/release/:hashId/results", verifyToken, viewReleaseResults);
+router.get("/release/:hashId/question-audio/:questionId", getQuestionAudio);
+router.get("/release/question-audio/:questionId", getQuestionAudio);
 
 router.post('/:hashId', upload.single("audio"), submitRelease);
 router.get('/pending-audits', verifyToken, getPendingAudits);
