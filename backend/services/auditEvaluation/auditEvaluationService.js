@@ -1,5 +1,7 @@
 'use strict';
+const mongoose = require('mongoose');
 const Audit = require('../../models/audit');
+const Victim = require('../../models/victim');
 const { retrieveStructuredContext } = require('./structuredRetrieval');
 const { retrieveSemanticContext } = require('./vectorRetrieval');
 const { assembleContext } = require('./contextAssembler');
@@ -41,10 +43,24 @@ async function runEvaluationPipeline(audit) {
   try {
     const auditPlain = audit.toObject ? audit.toObject() : audit;
 
+    // Resolve patient dataClassification for privacy gate
+    let victimClassification = 'real';
+    try {
+      const v = await Victim.findById(auditPlain.victimId).select('dataClassification').lean();
+      if (v?.dataClassification) victimClassification = v.dataClassification;
+    } catch {
+      victimClassification = 'real';
+    }
+
+    const privacyOptions = {
+      dataClassification: victimClassification,
+      databaseName: mongoose.connection?.name || ''
+    };
+
     // --- CASE 1: First audit (Baseline) ---
     // If patient has no prior history, produce a baseline evaluation without fabricating longitudinal comparisons
     if (auditPlain.isFirst) {
-      const baselineResult = {
+      const rawBaselineResult = {
         domain_evaluations: {
           medical_physical: {
             status: 'insufficient_data',
@@ -75,7 +91,7 @@ async function runEvaluationPipeline(audit) {
         ],
         fit_for_discharge: false,
         requires_human_review: false,
-        next_audit_date: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+        next_audit_date: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
         retrievalMetadata: {
           retrievalMode: 'structured_only',
           retrievedAuditIds: [auditId],
@@ -85,8 +101,15 @@ async function runEvaluationPipeline(audit) {
 
       // Perform deterministic safety check even on first audit
       const safetyResult = evaluateSafety(auditPlain, []);
-      if (safetyResult.urgent) baselineResult.urgent = true;
-      if (safetyResult.requiresHumanReview) baselineResult.requires_human_review = true;
+
+      // Validate & sanitize baseline result
+      const baselineValidation = validateAndSanitize(
+        rawBaselineResult,
+        { currentAudit: auditPlain, isFirstAudit: true, totalHistoricalAudits: 0 },
+        safetyResult
+      );
+
+      const finalBaseline = baselineValidation.result || rawBaselineResult;
 
       // Index initial audit so it can serve as baseline for future audits
       await indexAudit(auditPlain).catch(err => {
@@ -95,7 +118,7 @@ async function runEvaluationPipeline(audit) {
 
       await Audit.findByIdAndUpdate(audit._id, {
         $set: {
-          result: baselineResult,
+          result: finalBaseline,
           generatedResults: true,
           evaluationStatus: 'completed',
           evaluationVersion: 'rag-v1',
@@ -107,7 +130,7 @@ async function runEvaluationPipeline(audit) {
       return {
         success: true,
         audit: updated,
-        evaluation: baselineResult,
+        evaluation: finalBaseline,
         note: 'Baseline evaluation established for first audit'
       };
     }
@@ -129,7 +152,7 @@ async function runEvaluationPipeline(audit) {
       console.warn(`[auditEvaluationService] Indexing error for audit ${auditId}:`, idxErr.message);
     }
 
-    // Step 2: Structured retrieval from MongoDB (mandatory: baseline, previous, recent N, critical safety)
+    // Step 2: Structured retrieval from MongoDB (baseline, previous, recent N, safety, interventions)
     const currentTimestamp = auditPlain.timestamp || auditPlain.createdAt || new Date();
     const structuredContext = await retrieveStructuredContext(
       auditPlain.victimId,
@@ -142,17 +165,19 @@ async function runEvaluationPipeline(audit) {
       auditPlain,
       auditPlain.victimId,
       audit._id,
-      currentTimestamp
+      currentTimestamp,
+      privacyOptions
     );
 
     // Step 4: Assemble RAG context with deduplication and context budgeting
     const assembledContext = assembleContext(auditPlain, structuredContext, semanticContext);
+    assembledContext.victimClassification = victimClassification;
 
     // Step 5: Deterministic safety evaluation (safety rules override AI findings)
     const safetyEvaluation = evaluateSafety(auditPlain, structuredContext.criticalSafetyAudits || []);
 
     // Step 6: Evidence-grounded Gemini longitudinal evaluation
-    const rawAIEvaluation = await evaluateWithContext(assembledContext);
+    const rawAIEvaluation = await evaluateWithContext(assembledContext, privacyOptions);
 
     // Step 7: Strict schema & evidence reference validation
     const validation = validateAndSanitize(rawAIEvaluation, assembledContext, safetyEvaluation);
@@ -201,4 +226,3 @@ async function runEvaluationPipeline(audit) {
 }
 
 module.exports = { runEvaluationPipeline };
-

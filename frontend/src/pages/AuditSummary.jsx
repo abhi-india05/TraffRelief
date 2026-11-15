@@ -31,7 +31,8 @@ function AuditSummary() {
     if (!auditId || !token || !userData) return;
     try {
       setLoading(true);
-      const url = `http://localhost:5000/admin/audit-summary/${auditId}`;
+      const rolePrefix = userData.role === "admin" ? "admin" : "staff";
+      const url = `http://localhost:5000/${rolePrefix}/audit-summary/${auditId}`;
 
       const res = await fetch(url, {
         headers: { Authorization: `Bearer ${token}` },
@@ -46,7 +47,6 @@ function AuditSummary() {
       // Fetch interventions if victimId available
       if (data.victimId) {
         const victimIdStr = typeof data.victimId === "object" ? data.victimId.victimId || data.victimId._id : data.victimId;
-        const rolePrefix = userData.role === "admin" ? "admin" : "staff";
         try {
           const intRes = await fetch(`http://localhost:5000/${rolePrefix}/interventions/${victimIdStr}`, {
             headers: { Authorization: `Bearer ${token}` },

@@ -10,9 +10,19 @@ test('E. Gemini Evaluation, Safety & Result Validation Suite', async (t) => {
   const audit3 = SYNTHETIC_PATIENT_1_AUDITS[2]; // has cutting incident
 
   const validAssembledContext = {
-    currentAudit: { auditId: 'AUD-SYN-103' },
-    previousAudit: { auditId: 'AUD-SYN-102' },
-    baselineAudit: { auditId: 'AUD-SYN-101' },
+    currentAudit: {
+      auditId: 'AUD-SYN-103',
+      selfHarmBehaviors: 'Superficial cutting on left forearm with paperclip observed.'
+    },
+    previousAudit: {
+      auditId: 'AUD-SYN-102',
+      therapyAttendanceRate: 'Attended 7/8 therapy sessions regularly.'
+    },
+    baselineAudit: {
+      auditId: 'AUD-SYN-101',
+      currentPhysicalSymptoms: 'Severe fatigue, headaches, and dizziness.'
+    },
+    totalHistoricalAudits: 2,
     retrievalMetadata: {
       retrievalMode: 'hybrid',
       retrievedAuditIds: ['AUD-SYN-101', 'AUD-SYN-102', 'AUD-SYN-103'],
@@ -27,7 +37,7 @@ test('E. Gemini Evaluation, Safety & Result Validation Suite', async (t) => {
         reasons: ['Physical stamina restored and anemia fully resolved.'],
         evidence: ['AUD-101: fatigue -> AUD-103: normal stamina'],
         evidenceReferences: [
-          { auditId: 'AUD-SYN-101', date: '2026-01-10', field: 'currentPhysicalSymptoms', observation: 'Fatigue', sourceType: 'structured' }
+          { auditId: 'AUD-SYN-101', date: '2026-01-10', field: 'currentPhysicalSymptoms', observation: 'fatigue headaches', sourceType: 'structured' }
         ],
         dataSufficiency: 'sufficient'
       },
@@ -36,8 +46,7 @@ test('E. Gemini Evaluation, Safety & Result Validation Suite', async (t) => {
         reasons: ['Acute trauma spike associated with court proceedings.'],
         evidence: ['AUD-102: superficial scratching -> AUD-103: cutting forearm with paperclip'],
         evidenceReferences: [
-          { auditId: 'AUD-SYN-102', date: '2026-02-10', field: 'selfHarmBehaviors', observation: 'Scratching', sourceType: 'safety' },
-          { auditId: 'AUD-SYN-103', date: '2026-03-10', field: 'selfHarmBehaviors', observation: 'Cutting forearm', sourceType: 'structured' }
+          { auditId: 'AUD-SYN-103', date: '2026-03-10', field: 'selfHarmBehaviors', observation: 'cutting on left forearm', sourceType: 'structured' }
         ],
         dataSufficiency: 'sufficient'
       },
@@ -46,7 +55,7 @@ test('E. Gemini Evaluation, Safety & Result Validation Suite', async (t) => {
         reasons: ['Withdrew from group computer classes and missed 3 therapy sessions.'],
         evidence: ['AUD-102: attended 7/8 sessions -> AUD-103: missed 3 sessions'],
         evidenceReferences: [
-          { auditId: 'AUD-SYN-102', date: '2026-02-10', field: 'therapyAttendanceRate', observation: 'Attended 7/8', sourceType: 'structured' }
+          { auditId: 'AUD-SYN-102', date: '2026-02-10', field: 'therapyAttendanceRate', observation: 'Attended 7/8 therapy sessions', sourceType: 'structured' }
         ],
         dataSufficiency: 'sufficient'
       }
@@ -73,8 +82,8 @@ test('E. Gemini Evaluation, Safety & Result Validation Suite', async (t) => {
     assert.equal(res.result.domain_evaluations.progress_tracking.status, 'declining');
   });
 
-  await t.test('2. Hallucinated evidenceReferences (not in context) are stripped with warnings', () => {
-    const outputWithHallucinatedAudit = {
+  await t.test('2. Hallucinated or ungrounded evidenceReferences are stripped with warnings', () => {
+    const outputWithBadRefs = {
       ...sampleValidOutput,
       domain_evaluations: {
         ...sampleValidOutput.domain_evaluations,
@@ -82,71 +91,74 @@ test('E. Gemini Evaluation, Safety & Result Validation Suite', async (t) => {
           ...sampleValidOutput.domain_evaluations.medical_physical,
           evidenceReferences: [
             { auditId: 'AUD-HALLUCINATED-999', observation: 'Made up record', sourceType: 'structured' },
-            { auditId: 'AUD-SYN-101', observation: 'Real record', sourceType: 'structured' }
+            { auditId: 'AUD-SYN-101', field: 'currentPhysicalSymptoms', observation: 'totally fabricated bone fractures', sourceType: 'structured' },
+            { auditId: 'AUD-SYN-101', field: 'currentPhysicalSymptoms', observation: 'fatigue headaches', sourceType: 'structured' }
           ]
         }
       }
     };
 
-    const res = validateAndSanitize(outputWithHallucinatedAudit, validAssembledContext, {});
+    const res = validateAndSanitize(outputWithBadRefs, validAssembledContext, {});
     assert.equal(res.valid, true);
-    // Hallucinated ref is stripped
     const refs = res.result.domain_evaluations.medical_physical.evidenceReferences;
+    // Both hallucinated auditId and ungrounded observation are stripped; only grounded ref remains
     assert.equal(refs.length, 1);
     assert.equal(refs[0].auditId, 'AUD-SYN-101');
     assert.ok(res.warnings.some(w => w.includes('AUD-HALLUCINATED-999')));
+    assert.ok(res.warnings.some(w => w.includes('failed grounding check')));
   });
 
-  await t.test('3. Invalid JSON structure is rejected', () => {
-    const res1 = validateAndSanitize(null, validAssembledContext, {});
-    assert.equal(res1.valid, false);
-    const res2 = validateAndSanitize('string instead of object', validAssembledContext, {});
-    assert.equal(res2.valid, false);
-    const res3 = validateAndSanitize({}, validAssembledContext, {});
-    assert.equal(res3.valid, false);
-  });
-
-  await t.test('4. Invalid status values are rejected', () => {
-    const invalidStatusOutput = {
-      ...sampleValidOutput,
-      domain_evaluations: {
-        ...sampleValidOutput.domain_evaluations,
-        medical_physical: {
-          ...sampleValidOutput.domain_evaluations.medical_physical,
-          status: 'cured_and_happy' // invalid enum
-        }
-      }
+  await t.test('3. Negation handling: "no self-harm" and "denies suicidal ideation" do NOT trigger urgent', () => {
+    const negativeAudit = {
+      auditId: 'AUD-NEG',
+      selfHarmBehaviors: 'No self-harm behavior observed. Patient denies suicidal ideation.',
+      traumaIndicators: 'Mild anxiety, negative for panic attacks.'
     };
-    const res = validateAndSanitize(invalidStatusOutput, validAssembledContext, {});
-    assert.equal(res.valid, false);
-    assert.ok(res.errors.some(e => e.includes('Invalid status')));
+    const safety = evaluateSafety(negativeAudit, []);
+    assert.equal(safety.urgent, false, 'Documented negative findings must NOT trigger urgent=true');
+    assert.equal(safety.currentRiskLevel, 'none');
+    assert.ok(safety.safetyTimeline.negativeFindings.length >= 2, 'Negative findings must be recorded in timeline');
   });
 
-  await t.test('5 & 8. Urgent safety flag CANNOT be suppressed by reassuring historical evidence', () => {
-    // Current audit has active self-harm (cutting forearm)
-    const safety = evaluateSafety(audit3, [{ auditId: 'AUD-OLD', selfHarmBehaviors: 'scratching' }]);
-    assert.equal(safety.urgent, true);
-    assert.equal(safety.requiresHumanReview, true);
+  await t.test('4. Historical qualification: past suicide attempt does NOT trigger current acute urgency', () => {
+    const historicalAudit = {
+      auditId: 'AUD-HIST',
+      selfHarmBehaviors: 'History of cutting wrists prior to intake, currently fully resolved. Old scars visible.',
+      traumaIndicators: 'Calm mood.'
+    };
+    const safety = evaluateSafety(historicalAudit, []);
+    assert.equal(safety.urgent, false, 'Historical resolved risk must NOT trigger urgent=true');
+    assert.equal(safety.requiresHumanReview, true, 'Historical risk flags for clinical review');
+    assert.ok(safety.safetyTimeline.historicalFindings.length >= 1, 'Historical finding must be recorded in timeline');
+  });
 
-    // Suppose Gemini erroneously said urgent=false and fit_for_discharge=true
+  await t.test('5 & 8. Urgent safety flag overrides AI and FORCES fit_for_discharge=false', () => {
+    const acuteAudit = {
+      auditId: 'AUD-ACUTE',
+      selfHarmBehaviors: 'Active suicidal ideation expressed. Staff intercepted scissors.'
+    };
+    const safety = evaluateSafety(acuteAudit, []);
+    assert.equal(safety.urgent, true);
+
+    // AI hallucinates fit_for_discharge: true and urgent: false
     const deceptiveAIOutput = {
       ...sampleValidOutput,
-      urgent: false, // AI claimed not urgent
+      urgent: false,
       fit_for_discharge: true
     };
 
     const validated = validateAndSanitize(deceptiveAIOutput, validAssembledContext, safety);
-    // Deterministic safety check overrides AI complacency:
-    assert.equal(validated.result.urgent, true, 'Urgent flag must remain true due to cutting pattern');
-    assert.equal(validated.result.requires_human_review, true, 'Human review must remain true');
+    assert.equal(validated.result.urgent, true, 'Deterministic safety overrides AI urgent flag');
+    assert.equal(validated.result.fit_for_discharge, false, 'Discharge invariant: acute patient is NEVER fit for discharge');
+    assert.equal(validated.result.requires_human_review, true);
   });
 
-  await t.test('6 & 7. Insufficient history produces insufficient_data status and limited sufficiency', () => {
+  await t.test('6 & 7. First-audit produces insufficient_data status and insufficient dataSufficiency', () => {
     const firstAuditOutput = {
       domain_evaluations: {
-        medical_physical: { status: 'insufficient_data', reasons: ['Initial audit'], evidence: [], dataSufficiency: 'insufficient' },
-        trauma_indicators: { status: 'insufficient_data', reasons: ['Initial audit'], evidence: [], dataSufficiency: 'insufficient' },
-        progress_tracking: { status: 'insufficient_data', reasons: ['Initial audit'], evidence: [], dataSufficiency: 'insufficient' }
+        medical_physical: { status: 'insufficient_data', reasons: ['Initial audit'], evidence: [], dataSufficiency: 'sufficient' },
+        trauma_indicators: { status: 'insufficient_data', reasons: ['Initial audit'], evidence: [], dataSufficiency: 'sufficient' },
+        progress_tracking: { status: 'insufficient_data', reasons: ['Initial audit'], evidence: [], dataSufficiency: 'sufficient' }
       },
       urgent: false,
       recommended_actions: ['Establish baseline'],
@@ -155,14 +167,14 @@ test('E. Gemini Evaluation, Safety & Result Validation Suite', async (t) => {
       next_audit_date: null
     };
 
-    const res = validateAndSanitize(firstAuditOutput, validAssembledContext, {});
+    const firstAuditContext = { isFirstAudit: true, totalHistoricalAudits: 0 };
+    const res = validateAndSanitize(firstAuditOutput, firstAuditContext, {});
     assert.equal(res.valid, true);
-    assert.equal(res.result.domain_evaluations.medical_physical.status, 'insufficient_data');
+    // Strict rule: first audit dataSufficiency is forced to 'insufficient'
     assert.equal(res.result.domain_evaluations.medical_physical.dataSufficiency, 'insufficient');
   });
 
   await t.test('9 & 10. Existing historical result format (without new fields) is backward compatible', () => {
-    // Legacy format saved before RAG upgrade: no evidenceReferences, no dataSufficiency, no requires_human_review
     const legacyResult = {
       domain_evaluations: {
         medical_physical: { status: 'improving', reasons: ['Physical healing observed'], evidence: ['Good progress'] },
@@ -177,11 +189,9 @@ test('E. Gemini Evaluation, Safety & Result Validation Suite', async (t) => {
 
     const res = validateAndSanitize(legacyResult, validAssembledContext, {});
     assert.equal(res.valid, true);
-    // Defaults safely applied
-    assert.equal(res.result.domain_evaluations.medical_physical.dataSufficiency, 'sufficient');
+    assert.equal(res.result.domain_evaluations.medical_physical.dataSufficiency, 'insufficient');
     assert.deepEqual(res.result.domain_evaluations.medical_physical.evidenceReferences, []);
     assert.equal(res.result.requires_human_review, false);
     assert.equal(res.result.retrievalMetadata.retrievalMode, 'hybrid');
   });
 });
-

@@ -1,5 +1,7 @@
 'use strict';
+const mongoose = require('mongoose');
 const AuditEvidenceChunk = require('../../models/auditEvidenceChunk');
+const Victim = require('../../models/victim');
 const { buildChunks } = require('./auditChunkBuilder');
 const { embedDocument, computeContentHash, EMBEDDING_MODEL, EMBEDDING_DIMENSIONS } = require('./embeddingService');
 
@@ -18,6 +20,21 @@ async function indexAudit(audit) {
   if (!RAG_ENABLED) return { success: true, indexed: 0, skipped: 0, failed: 0, note: 'RAG disabled' };
 
   const result = { success: true, indexed: 0, skipped: 0, failed: 0 };
+
+  // Resolve victim data classification for privacy gate
+  let dataClassification = audit.victimId?.dataClassification || audit.dataClassification;
+  if (!dataClassification && audit.victimId) {
+    try {
+      const v = await Victim.findById(audit.victimId).select('dataClassification').lean();
+      if (v) dataClassification = v.dataClassification;
+    } catch {
+      dataClassification = 'real';
+    }
+  }
+  const privacyOptions = {
+    dataClassification: dataClassification || 'real',
+    databaseName: mongoose.connection?.name || ''
+  };
 
   const chunks = buildChunks(audit);
 
@@ -44,7 +61,7 @@ async function indexAudit(audit) {
 
     if (RAG_VECTOR_ENABLED) {
       try {
-        embedding = await embedDocument(chunk.content);
+        embedding = await embedDocument(chunk.content, privacyOptions);
         embeddingModel = EMBEDDING_MODEL;
         embeddingDimensions = EMBEDDING_DIMENSIONS;
         embeddingVersion = EMBEDDING_VERSION;

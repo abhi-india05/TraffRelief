@@ -149,6 +149,12 @@ const victimSchema = new mongoose.Schema({
     },
     initialDetails: {
         type: initialDetailsSchema,
+    },
+    dataClassification: {
+        type: String,
+        enum: ['real', 'synthetic'],
+        default: 'real',
+        required: true,
     }
 },{timestamps: true});
 

@@ -6,7 +6,14 @@ const { embedQuery } = require('./embeddingService');
 const RAG_VECTOR_ENABLED = process.env.RAG_VECTOR_SEARCH_ENABLED === 'true';
 const VECTOR_INDEX_NAME = process.env.RAG_VECTOR_INDEX_NAME || 'audit_evidence_index';
 const TOP_K = parseInt(process.env.RAG_TOP_K_PER_DOMAIN || '5', 10);
-const MIN_SIMILARITY = parseFloat(process.env.RAG_MIN_SIMILARITY_THRESHOLD || '0.60');
+const MIN_COSINE_SIMILARITY = parseFloat(
+  process.env.RAG_MIN_COSINE_SIMILARITY || process.env.RAG_MIN_SIMILARITY_THRESHOLD || '0.60'
+);
+
+// MongoDB Atlas Vector Search normalized cosine score conversion:
+// In Atlas, with similarity="cosine", vectorSearchScore = (1 + cosineSimilarity) / 2.
+// Therefore, a desired raw cosine threshold of 0.60 requires an Atlas score of (1 + 0.60) / 2 = 0.80.
+const ATLAS_SCORE_THRESHOLD = (1 + MIN_COSINE_SIMILARITY) / 2;
 
 // Domain-specific query templates for semantic search
 const DOMAIN_QUERIES = {
@@ -43,16 +50,17 @@ const DOMAIN_QUERIES = {
  * @param {ObjectId} victimObjectId - for patient isolation filter
  * @param {ObjectId} currentAuditObjectId - excluded from results
  * @param {Date} currentAuditTimestamp - exclude future records
+ * @param {Object} [privacyOptions] - { dataClassification, databaseName }
  * @returns {Promise<Array>}
  */
-async function retrieveByDomain(domain, currentAudit, victimObjectId, currentAuditObjectId, currentAuditTimestamp) {
+async function retrieveByDomain(domain, currentAudit, victimObjectId, currentAuditObjectId, currentAuditTimestamp, privacyOptions = {}) {
   if (!RAG_VECTOR_ENABLED) return [];
 
   try {
     const queryText = DOMAIN_QUERIES[domain](currentAudit);
     if (!queryText || queryText.length < 10) return [];
 
-    const queryVector = await embedQuery(queryText);
+    const queryVector = await embedQuery(queryText, privacyOptions);
 
     // Atlas $vectorSearch with patient isolation pre-filter
     const pipeline = [
@@ -64,26 +72,35 @@ async function retrieveByDomain(domain, currentAudit, victimObjectId, currentAud
           numCandidates: TOP_K * 10,
           limit: TOP_K * 2, // over-fetch before filtering
           filter: {
-            victimId: victimObjectId,  // ObjectId — patient isolation enforced
+            victimId: victimObjectId,  // ObjectId — strict patient isolation enforced
             domain: domain,
             timestamp: { $lt: currentAuditTimestamp }
           }
         }
       },
-      { $addFields: { score: { $meta: 'vectorSearchScore' } } },
-      { $match: { score: { $gte: MIN_SIMILARITY } } },
+      { $addFields: { atlasScore: { $meta: 'vectorSearchScore' } } },
+      // Convert Atlas score to raw cosine similarity: rawCosine = 2 * atlasScore - 1
+      {
+        $addFields: {
+          rawCosine: {
+            $subtract: [{ $multiply: [2, '$atlasScore'] }, 1]
+          }
+        }
+      },
+      // Filter by normalized Atlas score threshold
+      { $match: { atlasScore: { $gte: ATLAS_SCORE_THRESHOLD } } },
       { $match: { auditRef: { $ne: currentAuditObjectId } } },
-      { $sort: { score: -1, timestamp: -1 } },
+      { $sort: { atlasScore: -1, timestamp: -1 } },
       { $limit: TOP_K },
-      { $project: { embedding: 0, _id: 0, victimId: 0, auditRef: 0 } } // strip sensitive fields
+      { $project: { embedding: 0, _id: 0, victimId: 0, auditRef: 0 } } // strip internal/sensitive fields
     ];
 
     const results = await AuditEvidenceChunk.aggregate(pipeline);
     return results;
   } catch (err) {
     if (err.message && err.message.includes('index') && err.message.includes('not found')) {
-      console.warn(`[vectorRetrieval] Atlas vector index "${VECTOR_INDEX_NAME}" not found for domain=${domain}. Using structured-only fallback. Configure the index per docs/HYBRID_RAG_AUDIT_EVALUATION.md.`);
-    } else if (err.message && err.message.includes('EMBEDDING_PRIVACY_GATE')) {
+      console.warn(`[vectorRetrieval] Atlas vector index "${VECTOR_INDEX_NAME}" not found for domain=${domain}. Using structured-only fallback.`);
+    } else if (err.message && err.message.includes('GEMINI_PRIVACY_POLICY')) {
       console.error('[vectorRetrieval] Privacy gate blocked embedding generation:', err.message);
     } else {
       console.error(`[vectorRetrieval] Vector search failed for domain=${domain}:`, err.message);
@@ -94,9 +111,14 @@ async function retrieveByDomain(domain, currentAudit, victimObjectId, currentAud
 
 /**
  * Retrieve semantic evidence for all three domains.
+ * @param {Object} currentAudit
+ * @param {ObjectId} victimObjectId
+ * @param {ObjectId} currentAuditObjectId
+ * @param {Date} currentAuditTimestamp
+ * @param {Object} [privacyOptions]
  * @returns {Promise<{medical_physical: [], trauma_indicators: [], progress_tracking: [], retrievalMode: string}>}
  */
-async function retrieveSemanticContext(currentAudit, victimObjectId, currentAuditObjectId, currentAuditTimestamp) {
+async function retrieveSemanticContext(currentAudit, victimObjectId, currentAuditObjectId, currentAuditTimestamp, privacyOptions = {}) {
   if (!RAG_VECTOR_ENABLED) {
     return {
       medical_physical: [],
@@ -107,9 +129,9 @@ async function retrieveSemanticContext(currentAudit, victimObjectId, currentAudi
   }
 
   const [medical, psychological, progress] = await Promise.all([
-    retrieveByDomain('medical_physical', currentAudit, victimObjectId, currentAuditObjectId, currentAuditTimestamp),
-    retrieveByDomain('trauma_indicators', currentAudit, victimObjectId, currentAuditObjectId, currentAuditTimestamp),
-    retrieveByDomain('progress_tracking', currentAudit, victimObjectId, currentAuditObjectId, currentAuditTimestamp)
+    retrieveByDomain('medical_physical', currentAudit, victimObjectId, currentAuditObjectId, currentAuditTimestamp, privacyOptions),
+    retrieveByDomain('trauma_indicators', currentAudit, victimObjectId, currentAuditObjectId, currentAuditTimestamp, privacyOptions),
+    retrieveByDomain('progress_tracking', currentAudit, victimObjectId, currentAuditObjectId, currentAuditTimestamp, privacyOptions)
   ]);
 
   const totalRetrieved = medical.length + psychological.length + progress.length;
@@ -122,4 +144,9 @@ async function retrieveSemanticContext(currentAudit, victimObjectId, currentAudi
   };
 }
 
-module.exports = { retrieveSemanticContext };
+module.exports = {
+  retrieveSemanticContext,
+  retrieveByDomain,
+  ATLAS_SCORE_THRESHOLD,
+  MIN_COSINE_SIMILARITY
+};

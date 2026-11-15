@@ -1,15 +1,35 @@
 const express = require("express");
-const { getVictims, getVictimById, getStaffById, getNotifications, addInitialDetails,getStaffAudits,getMyVictims } = require("../controllers/staff.js");
 const router = express.Router();
 const upload = require('../middlewares/upload');
-const { addAudit } = require("../controllers/audit.js");
+const {
+  getVictims,
+  getVictimById,
+  getStaffById,
+  getNotifications,
+  addInitialDetails,
+  getStaffAudits,
+  getMyVictims,
+  getReleasedVictims
+} = require("../controllers/staff.js");
+const {
+  addAudit,
+  getPendingAudits,
+  getAuditsByVictimId,
+  getAuditDetails
+} = require("../controllers/audit.js");
 const { evaluateAudit, retryAuditEvaluation } = require("../controllers/gemini.js");
-const { getVictimInterventions, createIntervention, updateIntervention } = require("../controllers/intervention.js");
-const {createRelease,submitRelease,viewReleaseResults,viewReleaseByVictim}=require("../controllers/release.js")
-const {getPendingAudits}=require("../controllers/audit.js");
-const {getReleasedVictims}=require("../controllers/staff.js");
-const { getAuditsByVictimId } = require('../controllers/audit.js');
-const {verifyToken} = require('../middlewares/authentication.js');
+const {
+  getVictimInterventions,
+  createIntervention,
+  updateIntervention
+} = require("../controllers/intervention.js");
+const {
+  createRelease,
+  submitRelease,
+  viewReleaseResults,
+  viewReleaseByVictim
+} = require("../controllers/release.js");
+const { verifyToken } = require('../middlewares/authentication.js');
 const { uploadCloud } = require("../utils/cloudinary.js");
 
 router.get('/get-my-victims', verifyToken, getMyVictims);
@@ -31,6 +51,7 @@ router.get('/pending-audits', verifyToken, getPendingAudits);
 router.get('/:staffId/pending-audits', verifyToken, getPendingAudits);
 router.get('/:staffId/released-victims', verifyToken, getReleasedVictims);
 router.get('/victim/:victimId/audits', verifyToken, getAuditsByVictimId);
+router.get('/audit-summary/:auditId', verifyToken, getAuditDetails);
 
 // Evaluation retry and intervention routes
 router.post('/audit/:auditId/retry-evaluation', verifyToken, retryAuditEvaluation);

@@ -2,20 +2,17 @@
 require('dotenv').config();
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const crypto = require('crypto');
+const { assertGeminiDataAccess, sanitizeClinicalText } = require('../geminiPrivacyPolicy');
 
 const EMBEDDING_MODEL = process.env.GEMINI_EMBEDDING_MODEL || 'gemini-embedding-001';
 const EMBEDDING_DIMENSIONS = parseInt(process.env.GEMINI_EMBEDDING_DIMENSIONS || '768', 10);
-const GEMINI_API_TIER = (process.env.GEMINI_API_TIER || '').toLowerCase();
-const ALLOW_FREE_SYNTHETIC = process.env.ALLOW_FREE_GEMINI_FOR_SYNTHETIC_DATA === 'true';
-const NODE_ENV = process.env.NODE_ENV || 'development';
 
-function checkPrivacyGate() {
-  if (GEMINI_API_TIER === 'paid') return; // always allowed
-  if (NODE_ENV !== 'production' && ALLOW_FREE_SYNTHETIC) return; // dev with explicit consent
-  if (GEMINI_API_TIER === '') {
-    throw new Error('EMBEDDING_PRIVACY_GATE: GEMINI_API_TIER is not configured. Set to "paid" for production or "free" with ALLOW_FREE_GEMINI_FOR_SYNTHETIC_DATA=true for synthetic dev data only.');
-  }
-  throw new Error('EMBEDDING_PRIVACY_GATE: Real patient data must not be sent to Gemini Free Tier. Set GEMINI_API_TIER=paid or configure for synthetic data only.');
+function checkPrivacyGate(options = {}) {
+  return assertGeminiDataAccess({
+    operation: 'embedding_privacy_gate',
+    dataClassification: options.dataClassification || 'real',
+    databaseName: options.databaseName || ''
+  });
 }
 
 function l2Normalize(vec) {
@@ -52,26 +49,42 @@ async function embedWithRetry(genAI, text, taskType, attempt = 0) {
 
 /**
  * Generate a document embedding (for indexing stored chunks).
- * @param {string} text — sanitised content text, no PII
+ * @param {string} text — content text
+ * @param {Object} [options] - privacy and context options
+ * @param {string} [options.dataClassification] - 'real' | 'synthetic'
+ * @param {string} [options.databaseName] - database name
  * @returns {Promise<number[]>} 768-dim L2-normalised vector
  */
-async function embedDocument(text) {
-  checkPrivacyGate();
+async function embedDocument(text, options = {}) {
+  assertGeminiDataAccess({
+    operation: 'embed_document',
+    dataClassification: options.dataClassification || 'real',
+    databaseName: options.databaseName || ''
+  });
   if (!process.env.GEMINI_API_KEY) throw new Error('GEMINI_API_KEY not configured');
+  const sanitizedText = sanitizeClinicalText(text);
   const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-  return embedWithRetry(genAI, text, 'RETRIEVAL_DOCUMENT');
+  return embedWithRetry(genAI, sanitizedText, 'RETRIEVAL_DOCUMENT');
 }
 
 /**
  * Generate a query embedding (for semantic search).
- * @param {string} text — sanitised query text, no PII
+ * @param {string} text — query text
+ * @param {Object} [options] - privacy and context options
+ * @param {string} [options.dataClassification] - 'real' | 'synthetic'
+ * @param {string} [options.databaseName] - database name
  * @returns {Promise<number[]>} 768-dim L2-normalised vector
  */
-async function embedQuery(text) {
-  checkPrivacyGate();
+async function embedQuery(text, options = {}) {
+  assertGeminiDataAccess({
+    operation: 'embed_query',
+    dataClassification: options.dataClassification || 'real',
+    databaseName: options.databaseName || ''
+  });
   if (!process.env.GEMINI_API_KEY) throw new Error('GEMINI_API_KEY not configured');
+  const sanitizedText = sanitizeClinicalText(text);
   const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-  return embedWithRetry(genAI, text, 'RETRIEVAL_QUERY');
+  return embedWithRetry(genAI, sanitizedText, 'RETRIEVAL_QUERY');
 }
 
 /**
@@ -83,4 +96,11 @@ function computeContentHash(text) {
   return crypto.createHash('sha256').update(text, 'utf8').digest('hex');
 }
 
-module.exports = { embedDocument, embedQuery, computeContentHash, EMBEDDING_MODEL, EMBEDDING_DIMENSIONS };
+module.exports = {
+  embedDocument,
+  embedQuery,
+  computeContentHash,
+  checkPrivacyGate,
+  EMBEDDING_MODEL,
+  EMBEDDING_DIMENSIONS
+};

@@ -2,6 +2,7 @@
 require('dotenv').config();
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const { convertRawToJSON_usingJSON5 } = require('../../utils/utils.js');
+const { assertGeminiDataAccess, sanitizeClinicalObject } = require('../geminiPrivacyPolicy');
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_EVALUATION_MODEL || 'gemini-2.5-flash-lite';
@@ -24,20 +25,20 @@ CRITICAL CLINICAL & EVALUATION GUIDELINES:
    - reasons: array of 2–5 concise clinical reasons (each 6–40 words) referencing specific documented changes.
    - evidence: array of 2–6 concise evidence strings (each 6–40 words) indicating directionality (e.g., "AUD-101: sleep disturbed -> AUD-102: normal sleep").
    - evidenceReferences: array of objects referencing exact audits from the context:
-     [{"auditId": "AUD-###", "date": "YYYY-MM-DD", "field": "fieldName", "observation": "brief summary", "sourceType": "structured|semantic|safety"}]
-     CRITICAL: Only reference auditIds that are present in the provided context! Do NOT invent audit IDs.
+     [{"auditId": "AUD-###", "date": "YYYY-MM-DD", "field": "fieldName", "observation": "exact brief quote/summary", "sourceType": "structured|semantic|safety"}]
+     CRITICAL: Only reference auditIds that are present in the provided context! Only reference observations that actually appear in those audits. Do NOT invent audit IDs or observations.
    - dataSufficiency: "sufficient" | "limited" | "insufficient".
 4. Missing Data & Negation Rules:
    - An empty field or missing observation does NOT mean the condition has resolved or is normal.
    - Clearly distinguish between a documented negative finding ("no self-harm observed") and an unrecorded/missing field.
-   - Do not claim an intervention caused improvement unless explicitly documented; report temporal association only.
+   - Consider documented rehabilitation interventions when evaluating trajectory. Do not claim an intervention caused improvement unless explicitly documented; report temporal association only.
    - Do not infer psychiatric or medical diagnoses.
 5. Safety & Urgency:
-   - urgent: true or false. Set true if ANY acute safety, medical, or severe psychological risk is present in the current audit (e.g., suicidal ideation, self-harm, unaddressed severe injuries, acute psychosis, severe distress). Otherwise false.
+   - urgent: true or false. Set true ONLY if ANY acute safety, medical, or severe psychological risk is currently present (e.g., active suicidal ideation, fresh self-harm, unaddressed severe injuries, acute psychosis, severe distress). Do NOT set urgent=true solely for historical, resolved, or denied symptoms.
    - requires_human_review: true or false. Set true if urgent is true, if severe setbacks exist, or if conflicting historical data is observed.
 6. Recommendations & Discharge:
    - recommended_actions: array of 1–8 short actionable items (each 6–30 words) prioritizing immediate safety, medical care, therapy, and social support.
-   - fit_for_discharge: boolean. Set true ONLY if sustained improvement is documented across all domains, no urgent concerns exist, and functional support is in place. Otherwise false.
+   - fit_for_discharge: boolean. Set true ONLY if sustained improvement is documented across all domains, no urgent concerns exist, and functional support is in place. If urgent=true, fit_for_discharge MUST be false.
    - next_audit_date: an ISO 8601 date string (YYYY-MM-DD). If immediate follow-up is needed use 3–7 days ahead; standard interval is 14–30 days.
 
 REQUIRED OUTPUT JSON SCHEMA:
@@ -88,24 +89,38 @@ REQUIRED OUTPUT JSON SCHEMA:
  * Call Gemini to perform longitudinal evaluation on the assembled RAG context.
  *
  * @param {Object} assembledContext - complete context from contextAssembler
+ * @param {Object} [options] - privacy and evaluation options
+ * @param {string} [options.dataClassification] - 'real' | 'synthetic'
+ * @param {string} [options.databaseName] - MongoDB database name
  * @returns {Promise<Object>} parsed raw evaluation object
  */
-async function evaluateWithContext(assembledContext) {
+async function evaluateWithContext(assembledContext, options = {}) {
+  // Enforce centralized privacy gate
+  assertGeminiDataAccess({
+    operation: 'audit_evaluation',
+    dataClassification: options.dataClassification || assembledContext?.victimClassification || 'real',
+    databaseName: options.databaseName || ''
+  });
+
   if (!GEMINI_API_KEY || !genAI || !model) {
     throw new Error('Gemini API is not configured. GEMINI_API_KEY is missing or invalid.');
   }
 
-  const promptPayload = {
+  const rawPayload = {
     currentAssessment: assembledContext.currentAudit,
     immediatelyPrecedingAssessment: assembledContext.previousAudit || null,
     initialBaselineAssessment: assembledContext.baselineAudit || null,
     recentChronologicalHistory: assembledContext.recentChronologicalHistory || [],
     semanticallyRetrievedEvidence: assembledContext.domainEvidence || {},
     criticalHistoricalSafetyObservations: assembledContext.historicalSafetyIndicators || [],
+    activeAndPastInterventions: assembledContext.rehabilitationInterventions || [],
     previousAIEvaluations: assembledContext.previousAIRecommendations || [],
     contextWarnings: assembledContext.contextWarnings || [],
     availableAuditIds: assembledContext.retrievalMetadata?.retrievedAuditIds || []
   };
+
+  // Sanitize any free-text clinical data before assembling outbound prompt
+  const promptPayload = sanitizeClinicalObject(rawPayload);
 
   const userPrompt = `Perform a longitudinal rehabilitation evaluation for this patient case.\n\nEVALUATION CONTEXT:\n${JSON.stringify(promptPayload, null, 2)}\n\nProduce ONLY the strict JSON object specified in your system instructions.`;
 
@@ -136,4 +151,3 @@ async function evaluateWithContext(assembledContext) {
 }
 
 module.exports = { evaluateWithContext, SYSTEM_INSTRUCTION };
-

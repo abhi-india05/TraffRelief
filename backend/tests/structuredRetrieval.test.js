@@ -1,9 +1,8 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const mongoose = require('mongoose');
 
-const { assembleContext } = require('../services/auditEvaluation/contextAssembler');
+const { assembleContext, MAX_CONTEXT_CHARS } = require('../services/auditEvaluation/contextAssembler');
 const { SYNTHETIC_PATIENT_1_AUDITS } = require('./fixtures/syntheticPatients');
 
 test('B. Structured Retrieval & Context Assembly Suite', async (t) => {
@@ -13,12 +12,12 @@ test('B. Structured Retrieval & Context Assembly Suite', async (t) => {
   const audit3 = audits[2]; // Mar 10
 
   await t.test('1. First-audit behavior correctly handles lack of prior history', () => {
-    // When evaluating the first audit, totalHistorical is 0
     const mockStructuredFirst = {
       previousAudit: null,
       baselineAudit: null,
       recentChronologicalHistory: [],
       criticalSafetyAudits: [],
+      rehabilitationInterventions: [],
       previousAIRecommendations: [],
       totalHistoricalAudits: 0,
       isFirstAudit: true,
@@ -41,7 +40,6 @@ test('B. Structured Retrieval & Context Assembly Suite', async (t) => {
   });
 
   await t.test('2, 3 & 4. Baseline and previous audits are identified and chronologically ordered', () => {
-    // For Audit 3: previous is Audit 2, baseline is Audit 1
     const priorHistory = [audit2, audit1]; // sorted desc by timestamp
 
     const previous = priorHistory[0]; // Audit 2
@@ -53,7 +51,6 @@ test('B. Structured Retrieval & Context Assembly Suite', async (t) => {
     assert.equal(recentChronological[0].auditId, 'AUD-SYN-101');
     assert.equal(recentChronological[1].auditId, 'AUD-SYN-102');
 
-    // Chronological order verification
     assert.ok(
       new Date(recentChronological[0].timestamp) < new Date(recentChronological[1].timestamp),
       'Recent history must be ordered oldest to newest'
@@ -62,7 +59,6 @@ test('B. Structured Retrieval & Context Assembly Suite', async (t) => {
 
   await t.test('5. Future assessments (timestamp >= current) are excluded from historical retrieval', () => {
     const currentAuditTime = new Date('2026-02-10T10:00:00Z');
-    // Audit 3 is dated 2026-03-10 (future relative to Audit 2)
     const filtered = audits.filter(a => new Date(a.timestamp) < currentAuditTime);
 
     assert.equal(filtered.length, 1);
@@ -70,21 +66,33 @@ test('B. Structured Retrieval & Context Assembly Suite', async (t) => {
     assert.ok(!filtered.some(a => a.auditId === 'AUD-SYN-103'), 'Future audit 103 must be excluded');
   });
 
-  await t.test('6. Historical critical safety observations are retrieved regardless of vector similarity', () => {
-    // Audit 2 had superficial scratching; Audit 3 has cutting
-    const criticalSafetyFilter = (auditList) => auditList.filter(a => {
-      const sh = (a.selfHarmBehaviors || '').toLowerCase();
-      const hasSelfHarm = sh && !sh.includes('none') && !sh.includes('no self-harm');
-      const setbacks = (a.setbacksIndicator || '').toLowerCase();
-      const hasCriticalSetback = /severe|crisis|emergency|deteriorat/i.test(setbacks);
-      return hasSelfHarm || hasCriticalSetback;
-    });
+  await t.test('6. Rehabilitation interventions are integrated into assembled context', () => {
+    const mockInterventions = [
+      {
+        id: 'INT-001',
+        sourceType: 'manual',
+        recommendedIntervention: 'Trauma-informed art therapy twice weekly',
+        status: 'in_progress',
+        dateRecommended: new Date('2026-01-15')
+      }
+    ];
 
-    const historicalSafety = criticalSafetyFilter(audits);
-    // Audit 2 (scratching) and Audit 3 (cutting forearm) both have critical indicators
-    assert.equal(historicalSafety.length, 2);
-    assert.ok(historicalSafety.some(a => a.auditId === 'AUD-SYN-102'));
-    assert.ok(historicalSafety.some(a => a.auditId === 'AUD-SYN-103'));
+    const mockStructured = {
+      previousAudit: audit2,
+      baselineAudit: audit1,
+      recentChronologicalHistory: [audit1, audit2],
+      criticalSafetyAudits: [],
+      rehabilitationInterventions: mockInterventions,
+      previousAIRecommendations: [],
+      totalHistoricalAudits: 2,
+      isFirstAudit: false,
+      retrievedAuditIds: [audit1.auditId, audit2.auditId]
+    };
+
+    const assembled = assembleContext(audit3, mockStructured, {});
+    assert.ok(Array.isArray(assembled.rehabilitationInterventions));
+    assert.equal(assembled.rehabilitationInterventions.length, 1);
+    assert.equal(assembled.rehabilitationInterventions[0].id, 'INT-001');
   });
 
   await t.test('7. Context assembler dedupes semantic evidence already present in structured history', () => {
@@ -93,6 +101,7 @@ test('B. Structured Retrieval & Context Assembly Suite', async (t) => {
       baselineAudit: audit1,
       recentChronologicalHistory: [audit1, audit2],
       criticalSafetyAudits: [audit2],
+      rehabilitationInterventions: [],
       previousAIRecommendations: [],
       totalHistoricalAudits: 2,
       isFirstAudit: false,
@@ -118,19 +127,40 @@ test('B. Structured Retrieval & Context Assembly Suite', async (t) => {
     assert.ok(assembled.retrievalMetadata.retrievedAuditIds.includes('AUD-SYN-099'));
   });
 
-  await t.test('8. Missing values are preserved and not substituted with negative findings', () => {
-    const auditWithMissing = {
-      auditId: 'AUD-TEST-MISSING',
-      currentPhysicalSymptoms: '', // missing
-      physicalInjuriesSustained: null, // missing
-      selfHarmBehaviors: undefined // missing
+  await t.test('8. Token-aware budgeting trims lower-priority chunks when context exceeds budget', () => {
+    // Generate large semantic evidence chunks that exceed MAX_CONTEXT_CHARS (36,000)
+    const largeChunks = Array.from({ length: 15 }, (_, i) => ({
+      auditId: `AUD-OLD-${i}`,
+      content: 'Lengthy historical medical report with detailed symptoms. '.repeat(200) // ~11,000 chars each
+    }));
+
+    const structuredMock = {
+      previousAudit: audit2,
+      baselineAudit: audit1,
+      recentChronologicalHistory: [audit1, audit2],
+      criticalSafetyAudits: [],
+      rehabilitationInterventions: [],
+      previousAIRecommendations: [],
+      totalHistoricalAudits: 2,
+      isFirstAudit: false,
+      retrievedAuditIds: [audit1.auditId, audit2.auditId]
     };
 
-    // When structured retrieval or sanitization runs, empty fields remain empty/undefined
-    assert.equal(auditWithMissing.currentPhysicalSymptoms, '');
-    assert.equal(auditWithMissing.physicalInjuriesSustained, null);
-    // Verify they are NOT falsified to "No injuries observed" or "Resolved"
-    assert.notEqual(auditWithMissing.physicalInjuriesSustained, 'No injuries sustained');
+    const semanticMock = {
+      medical_physical: largeChunks,
+      trauma_indicators: [],
+      progress_tracking: [],
+      retrievalMode: 'hybrid'
+    };
+
+    const assembled = assembleContext(audit3, structuredMock, semanticMock);
+
+    // Context budget must be respected and lower-priority semantic chunks trimmed
+    assert.ok(assembled.retrievalMetadata.budget.totalChars > 0);
+    assert.ok(assembled.domainEvidence.medical_physical.length <= 2, 'Semantic chunks must be trimmed under budget pressure');
+    // Core records are strictly preserved:
+    assert.ok(assembled.currentAudit);
+    assert.ok(assembled.previousAudit);
+    assert.ok(assembled.baselineAudit);
   });
 });
-

@@ -1,9 +1,11 @@
 require("dotenv").config();
 
 const fs = require("fs");
+const mongoose = require("mongoose");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const axios = require("axios");
 const { v4: uuidv4 } = require("uuid");
+const { assertGeminiDataAccess, sanitizeClinicalText } = require("../services/geminiPrivacyPolicy");
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const BERT_URL = process.env.BERT_PREDICTION_URL; // Your FastAPI endpoint
@@ -78,6 +80,28 @@ async function submitRelease(req, res) {
       return res.status(400).json({ error: "Audio file is required (field name: 'audio')" });
     }
 
+    // find release record and associated victim FIRST before invoking AI
+    const releaseRecord = await Release.findOne({ hashLink: hashId }).populate("victimId");
+    if (!releaseRecord) {
+      try { fs.unlinkSync(req.file.path); } catch (e) { /* ignore */ }
+      return res.status(404).json({ error: "Release record not found" });
+    }
+    if (releaseRecord.submitted) {
+      try { fs.unlinkSync(req.file.path); } catch (e) { /* ignore */ }
+      return res.status(400).json({ error: "Release has already been submitted" });
+    }
+
+    const victim = releaseRecord.victimId;
+    const dataClassification = victim?.dataClassification || "real";
+    const databaseName = mongoose.connection?.name || "";
+
+    // Enforce privacy gate before audio transcription
+    assertGeminiDataAccess({
+      operation: "audio_transcription",
+      dataClassification,
+      databaseName
+    });
+
     const audioPath = req.file.path;
 
     // read and delete uploaded file
@@ -95,8 +119,15 @@ async function submitRelease(req, res) {
     const transcript = transcriptionResult.response.text().trim();
     console.log("Transcript:", transcript);
 
-    // Summarization
-    const summarizationPrompt = `Summarize this text in one emotionally-aware English sentence. Keep distress or emotion keywords intact.\nText: "${transcript}"`;
+    // Enforce privacy gate and sanitize text before summarization
+    assertGeminiDataAccess({
+      operation: "audio_summarization",
+      dataClassification,
+      databaseName
+    });
+
+    const sanitizedTranscript = sanitizeClinicalText(transcript);
+    const summarizationPrompt = `Summarize this text in one emotionally-aware English sentence. Keep distress or emotion keywords intact.\nText: "${sanitizedTranscript}"`;
 
     const summaryResult = await model.generateContent([{ text: summarizationPrompt }]);
     const summary = summaryResult.response.text().trim();
@@ -106,15 +137,6 @@ async function submitRelease(req, res) {
     const bertResp = await axios.post(BERT_URL, { text: summary });
     const result = bertResp.data;
     console.log("BERT Analysis:", result);
-
-    // find release record
-    const releaseRecord = await Release.findOne({ hashLink: hashId });
-    if (!releaseRecord) {
-      return res.status(404).json({ error: "Release record not found" });
-    }
-    if (releaseRecord.submitted) {
-      return res.status(400).json({ error: "Release has already been submitted" });
-    }
 
     // ensure results object exists
     releaseRecord.submitted = true;

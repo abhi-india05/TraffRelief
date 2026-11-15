@@ -6,11 +6,95 @@ const VALID_RETRIEVAL_MODES = new Set(['structured_only', 'hybrid']);
 const REQUIRED_DOMAINS = ['medical_physical', 'trauma_indicators', 'progress_tracking'];
 
 /**
+ * Normalise text for fuzzy grounding comparison.
+ */
+function normalizeText(str) {
+  if (!str || typeof str !== 'string') return '';
+  return str.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Check whether an observation quotation or claim is grounded in source text.
+ * Requires either a substring match or high keyword overlap.
+ *
+ * @param {string} observation - AI reported observation/quote
+ * @param {string} sourceText - Actual audit text
+ * @returns {boolean}
+ */
+function isObservationGrounded(observation, sourceText) {
+  if (!observation || !sourceText) return false;
+  const normObs = normalizeText(observation);
+  const normSrc = normalizeText(sourceText);
+
+  if (normSrc.includes(normObs)) return true;
+
+  // Keyword token overlap check
+  const obsTokens = normObs.split(' ').filter(t => t.length > 3);
+  if (obsTokens.length === 0) return true;
+
+  const matches = obsTokens.filter(t => normSrc.includes(t));
+  const overlapRatio = matches.length / obsTokens.length;
+
+  return overlapRatio >= 0.5; // At least 50% of salient clinical terms appear in source
+}
+
+/**
+ * Build a lookup map of all audit records and evidence chunks in the assembled context.
+ *
+ * @param {Object} assembledContext
+ * @returns {Map<string, Object>} auditId -> audit field data
+ */
+function buildContextAuditMap(assembledContext) {
+  const auditMap = new Map();
+
+  function registerAudit(a) {
+    if (!a || !a.auditId) return;
+    const existing = auditMap.get(a.auditId) || { fields: {}, fullText: '' };
+    for (const [k, v] of Object.entries(a)) {
+      if (typeof v === 'string') {
+        existing.fields[k] = v;
+        existing.fullText += ' ' + v;
+      }
+    }
+    if (a.timestamp) existing.timestamp = a.timestamp;
+    auditMap.set(a.auditId, existing);
+  }
+
+  registerAudit(assembledContext?.currentAudit);
+  registerAudit(assembledContext?.previousAudit);
+  registerAudit(assembledContext?.baselineAudit);
+
+  (assembledContext?.recentChronologicalHistory || []).forEach(registerAudit);
+  (assembledContext?.historicalSafetyIndicators || []).forEach(registerAudit);
+
+  // Register semantic domain chunks
+  const domainEvidence = assembledContext?.domainEvidence || {};
+  for (const chunks of Object.values(domainEvidence)) {
+    if (Array.isArray(chunks)) {
+      for (const chunk of chunks) {
+        if (!chunk || !chunk.auditId) continue;
+        const existing = auditMap.get(chunk.auditId) || { fields: {}, fullText: '' };
+        if (chunk.content) existing.fullText += ' ' + chunk.content;
+        if (Array.isArray(chunk.sourceFields)) {
+          chunk.sourceFields.forEach(f => {
+            if (!existing.fields[f] && chunk.content) existing.fields[f] = chunk.content;
+          });
+        }
+        auditMap.set(chunk.auditId, existing);
+      }
+    }
+  }
+
+  return auditMap;
+}
+
+/**
  * Validate AI-generated result before persisting to MongoDB.
- * Rejects invalid schemas and sanitizes evidence references.
+ * Rejects invalid schemas, strips ungrounded or hallucinated evidence references,
+ * and enforces deterministic safety overrides.
  *
  * @param {Object} parsed - raw parsed object from Gemini response
- * @param {Object} assembledContext - context used for generation (for evidence ref validation)
+ * @param {Object} assembledContext - context used for generation
  * @param {Object} safetyEvaluation - from safetyEvaluator (overrides AI urgent flag)
  * @returns {{ valid: boolean, result?: Object, errors?: string[], warnings?: string[] }}
  */
@@ -27,17 +111,9 @@ function validateAndSanitize(parsed, assembledContext, safetyEvaluation = {}) {
     return { valid: false, errors: ['Missing domain_evaluations in result'] };
   }
 
-  // Build the set of valid auditIds from the assembled context for hallucination prevention
-  const validContextAuditIds = new Set(assembledContext?.retrievalMetadata?.retrievedAuditIds || []);
-  if (assembledContext?.currentAudit?.auditId) {
-    validContextAuditIds.add(assembledContext.currentAudit.auditId);
-  }
-  if (assembledContext?.previousAudit?.auditId) {
-    validContextAuditIds.add(assembledContext.previousAudit.auditId);
-  }
-  if (assembledContext?.baselineAudit?.auditId) {
-    validContextAuditIds.add(assembledContext.baselineAudit.auditId);
-  }
+  const contextAuditMap = buildContextAuditMap(assembledContext);
+  const isFirstAudit = assembledContext?.isFirstAudit === true;
+  const totalHistorical = assembledContext?.totalHistoricalAudits || 0;
 
   const validatedDomains = {};
 
@@ -61,7 +137,7 @@ function validateAndSanitize(parsed, assembledContext, safetyEvaluation = {}) {
       errors.push(`${domain}.evidence must be an array of strings`);
     }
 
-    // Validate evidence references against context
+    // Validate evidence references against context audit map
     const validatedRefs = [];
     if (Array.isArray(d.evidenceReferences)) {
       for (const ref of d.evidenceReferences) {
@@ -70,10 +146,28 @@ function validateAndSanitize(parsed, assembledContext, safetyEvaluation = {}) {
           continue;
         }
 
-        // Check if auditId exists in context
-        if (validContextAuditIds.size > 0 && !validContextAuditIds.has(ref.auditId)) {
-          warnings.push(`Unverified evidenceReference auditId "${ref.auditId}" in ${domain} not found in retrieved context`);
+        const auditIdStr = String(ref.auditId).trim();
+
+        // 1. Check if auditId exists in context
+        if (!contextAuditMap.has(auditIdStr)) {
+          warnings.push(`Unverified evidenceReference auditId "${auditIdStr}" in ${domain} not found in retrieved context`);
           continue; // Strip hallucinated reference
+        }
+
+        const sourceAuditData = contextAuditMap.get(auditIdStr);
+
+        // 2. Observation grounding check
+        if (ref.observation && sourceAuditData) {
+          const targetFieldText = ref.field && sourceAuditData.fields[ref.field]
+            ? sourceAuditData.fields[ref.field]
+            : sourceAuditData.fullText;
+
+          if (targetFieldText && !isObservationGrounded(ref.observation, targetFieldText)) {
+            warnings.push(
+              `Evidence reference in ${domain} (audit ${auditIdStr}, field "${ref.field || 'all'}") failed grounding check: "${ref.observation.substring(0, 40)}..."`
+            );
+            continue; // Strip ungrounded reference
+          }
         }
 
         let refDate = null;
@@ -83,7 +177,7 @@ function validateAndSanitize(parsed, assembledContext, safetyEvaluation = {}) {
         }
 
         validatedRefs.push({
-          auditId: String(ref.auditId),
+          auditId: auditIdStr,
           date: refDate,
           field: ref.field ? String(ref.field) : null,
           observation: ref.observation ? String(ref.observation) : null,
@@ -92,7 +186,13 @@ function validateAndSanitize(parsed, assembledContext, safetyEvaluation = {}) {
       }
     }
 
-    const dataSufficiency = VALID_SUFFICIENCY.has(d.dataSufficiency) ? d.dataSufficiency : 'sufficient';
+    // Conservative data sufficiency rule
+    let dataSufficiency = VALID_SUFFICIENCY.has(d.dataSufficiency) ? d.dataSufficiency : 'insufficient';
+    if (isFirstAudit || totalHistorical === 0) {
+      dataSufficiency = 'insufficient';
+    } else if (totalHistorical < 2 && dataSufficiency === 'sufficient') {
+      dataSufficiency = 'limited';
+    }
 
     validatedDomains[domain] = {
       status: VALID_STATUSES.has(status) ? status : 'insufficient_data',
@@ -108,11 +208,14 @@ function validateAndSanitize(parsed, assembledContext, safetyEvaluation = {}) {
     return { valid: false, errors, warnings };
   }
 
-  // Safety evaluation override: deterministic safety rules take precedence
+  // Deterministic safety override: acute risk takes absolute precedence
   const urgent = safetyEvaluation.urgent === true || parsed.urgent === true;
   const requiresHumanReview = safetyEvaluation.requiresHumanReview === true ||
     parsed.requires_human_review === true ||
     urgent;
+
+  // Discharge safety invariant: an acute/urgent patient is NEVER fit for discharge
+  const fitForDischarge = urgent ? false : parsed.fit_for_discharge === true;
 
   // Validate next_audit_date
   let nextAuditDate = null;
@@ -135,7 +238,7 @@ function validateAndSanitize(parsed, assembledContext, safetyEvaluation = {}) {
     domain_evaluations: validatedDomains,
     urgent,
     recommended_actions: recommendedActions,
-    fit_for_discharge: parsed.fit_for_discharge === true,
+    fit_for_discharge: fitForDischarge,
     next_audit_date: nextAuditDate,
     requires_human_review: requiresHumanReview,
     retrievalMetadata: {
@@ -149,5 +252,11 @@ function validateAndSanitize(parsed, assembledContext, safetyEvaluation = {}) {
   return { valid: true, result: sanitizedResult, warnings };
 }
 
-module.exports = { validateAndSanitize, VALID_STATUSES, VALID_SUFFICIENCY, REQUIRED_DOMAINS };
-
+module.exports = {
+  validateAndSanitize,
+  isObservationGrounded,
+  buildContextAuditMap,
+  VALID_STATUSES,
+  VALID_SUFFICIENCY,
+  REQUIRED_DOMAINS
+};

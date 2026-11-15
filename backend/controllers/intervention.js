@@ -6,7 +6,7 @@ const Admin = require('../models/admin');
 const Audit = require('../models/audit');
 
 /**
- * Get all interventions for a victim.
+ * Get all interventions for a victim with strict authorization.
  * Route: GET /staff/interventions/:victimId or GET /admin/interventions/:victimId
  */
 async function getVictimInterventions(req, res) {
@@ -19,7 +19,7 @@ async function getVictimInterventions(req, res) {
     const victim = await Victim.findOne({ victimId });
     if (!victim) return res.status(404).json({ error: 'Victim not found' });
 
-    // Authorization
+    // Authorization: staff assigned or center admin
     if (authRole === 'staff') {
       const staff = await Staff.findOne({ staffId: authUserId });
       if (!staff || victim.staff?.toString() !== staff._id.toString()) {
@@ -36,6 +36,8 @@ async function getVictimInterventions(req, res) {
 
     const interventions = await RehabilitationIntervention.find({ victimId: victim._id })
       .populate('staffResponsible', 'fullName staffId')
+      .populate('sourceAuditRef', 'auditId timestamp')
+      .populate('followUpAuditRef', 'auditId timestamp')
       .sort({ dateRecommended: -1 })
       .lean();
 
@@ -47,16 +49,23 @@ async function getVictimInterventions(req, res) {
 }
 
 /**
- * Create a new rehabilitation intervention record.
- * Route: POST /staff/interventions/:victimId
+ * Create a new rehabilitation intervention record (manual or audit-recommended).
+ * Route: POST /staff/interventions/:victimId or POST /admin/interventions/:victimId
  */
 async function createIntervention(req, res) {
   try {
     const { victimId } = req.params;
     const { id: authUserId, role: authRole } = req.user || {};
-    const { sourceAuditId, recommendedIntervention, status, staffNotes } = req.body;
+    const {
+      sourceAuditId,
+      sourceType,
+      recommendedIntervention,
+      status,
+      staffNotes,
+      dateRecommended
+    } = req.body;
 
-    if (!recommendedIntervention) {
+    if (!recommendedIntervention || recommendedIntervention.trim() === '') {
       return res.status(400).json({ error: 'recommendedIntervention is required' });
     }
 
@@ -69,24 +78,40 @@ async function createIntervention(req, res) {
       if (!staff || victim.staff?.toString() !== staff._id.toString()) {
         return res.status(403).json({ error: 'You are not assigned to this victim' });
       }
+    } else if (authRole === 'admin') {
+      const admin = await Admin.findOne({ adminId: authUserId });
+      if (!admin || victim.admin?.toString() !== admin._id.toString()) {
+        return res.status(403).json({ error: 'Victim not under your administrative center' });
+      }
+    } else {
+      return res.status(403).json({ error: 'Unauthorized role' });
     }
 
     let auditRef = null;
-    let auditIdStr = sourceAuditId || 'MANUAL';
-    if (sourceAuditId) {
+    let auditIdStr = null;
+    let determinedSourceType = sourceType === 'manual' ? 'manual' : 'audit_recommendation';
+
+    if (sourceAuditId && sourceAuditId !== 'MANUAL') {
       const audit = await Audit.findOne({ auditId: sourceAuditId });
-      if (audit) auditRef = audit._id;
+      if (audit) {
+        auditRef = audit._id;
+        auditIdStr = audit.auditId;
+        determinedSourceType = 'audit_recommendation';
+      }
+    } else {
+      determinedSourceType = 'manual';
     }
 
     const intervention = new RehabilitationIntervention({
       victimId: victim._id,
-      sourceAuditRef: auditRef || victim._id, // fallback if manual
+      sourceAuditRef: auditRef,
       sourceAuditId: auditIdStr,
-      recommendedIntervention,
+      sourceType: determinedSourceType,
+      recommendedIntervention: recommendedIntervention.trim(),
       status: status || 'recommended',
-      staffResponsible: staff ? staff._id : null,
-      dateRecommended: new Date(),
-      staffNotes: staffNotes || null
+      staffResponsible: staff ? staff._id : (victim.staff || null),
+      dateRecommended: dateRecommended ? new Date(dateRecommended) : new Date(),
+      staffNotes: staffNotes ? staffNotes.trim() : null
     });
 
     await intervention.save();
@@ -98,16 +123,35 @@ async function createIntervention(req, res) {
 }
 
 /**
- * Update an existing intervention status/outcome.
+ * Update an existing intervention status/outcome with strict authorization.
  * Route: PATCH /staff/interventions/:interventionId or PATCH /admin/interventions/:interventionId
  */
 async function updateIntervention(req, res) {
   try {
     const { interventionId } = req.params;
+    const { id: authUserId, role: authRole } = req.user || {};
     const { status, observedOutcome, staffNotes, dateImplemented, followUpAuditId } = req.body;
 
     const intervention = await RehabilitationIntervention.findById(interventionId);
     if (!intervention) return res.status(404).json({ error: 'Intervention not found' });
+
+    // Look up victim to enforce patient authorization
+    const victim = await Victim.findById(intervention.victimId);
+    if (!victim) return res.status(404).json({ error: 'Associated victim record not found' });
+
+    if (authRole === 'staff') {
+      const staff = await Staff.findOne({ staffId: authUserId });
+      if (!staff || victim.staff?.toString() !== staff._id.toString()) {
+        return res.status(403).json({ error: 'You are not assigned to this victim' });
+      }
+    } else if (authRole === 'admin') {
+      const admin = await Admin.findOne({ adminId: authUserId });
+      if (!admin || victim.admin?.toString() !== admin._id.toString()) {
+        return res.status(403).json({ error: 'Victim not under your administrative center' });
+      }
+    } else {
+      return res.status(403).json({ error: 'Unauthorized role' });
+    }
 
     const updates = {};
     if (status) updates.status = status;
@@ -134,4 +178,3 @@ async function updateIntervention(req, res) {
 }
 
 module.exports = { getVictimInterventions, createIntervention, updateIntervention };
-
